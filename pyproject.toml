@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "roam-semantic-search"
+version = "0.1.0"
+description = "Fully local semantic search over a Roam Research graph: Local API fetch, local embeddings, hybrid retrieval"
+requires-python = ">=3.14"
+dependencies = [
+    "guffin",
+    "mcp",
+    "numpy",
+    "pydantic>=2",
+    "regex",
+    "requests",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "pydocstringformatter",
+    "pyright",
+    "pytest",
+    "ruff",
+    "types-regex",
+    "types-requests",
+]
+
+[project.scripts]
+roam-semantic-search = "roam_semantic_search.cli:app"
+roam-semantic-search-mcp = "roam_semantic_search.mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/roam_semantic_search"]
+
+[tool.black]
+line-length = 120
+target-version = ["py314"]
+
+[tool.ruff]
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "ANN", "D"]
+ignore = ["D203", "D213"]
+pydocstyle.convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
+[tool.pyright]
+include = ["src", "tests"]
+typeCheckingMode = "strict"
+pythonVersion = "3.14"
+venvPath = "."
+venv = ".venv"
+executionEnvironments = [{ root = "tests", reportPrivateUsage = false }]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+testpaths = ["tests"]
+pythonpath = ["tests"]
