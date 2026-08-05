@@ -53,7 +53,7 @@ def build(
     db_path: DbOption = None,
     model: Annotated[str, typer.Option("--model")] = DEFAULT_EMBED_MODEL,
     ollama_url: OllamaUrlOption = DEFAULT_OLLAMA_URL,
-    include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = False,
+    include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
 ) -> None:
     """Fetch the graph, normalize, embed locally, and (re)write the index store."""
     api_endpoint: Final[ApiEndpoint] = ApiEndpoint.from_parts(local_api_port=port, graph_name=graph, bearer_token=token)
@@ -87,7 +87,7 @@ def refresh(
     token: TokenOption,
     db_path: DbOption = None,
     ollama_url: OllamaUrlOption = DEFAULT_OLLAMA_URL,
-    include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = False,
+    include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
 ) -> None:
     """Incrementally update the store: re-embed only changed records, delete vanished ones."""
     resolved_db: Final[Path] = db_path if db_path is not None else default_db_path(graph)

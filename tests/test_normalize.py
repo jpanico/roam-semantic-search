@@ -111,14 +111,14 @@ class TestNormalizedRecords:
         ]
         assert normalized_records(rows) == []
 
-    def test_daily_notes_skipped_by_default_included_on_request(self) -> None:
+    def test_daily_notes_included_by_default_skipped_on_request(self) -> None:
         rows: Final[list[dict[str, object]]] = [
             _page_row(1, "08-04-2026", "August 4th, 2026"),
             _block_row(2, "block0001", "journal entry", 1, [1]),
         ]
-        assert normalized_records(rows) == []
-        included: Final[list[IndexRecord]] = normalized_records(rows, include_daily_notes=True)
+        included: Final[list[IndexRecord]] = normalized_records(rows)
         assert {record.uid for record in included} == {"08-04-2026", "block0001"}
+        assert normalized_records(rows, include_daily_notes=False) == []
 
     def test_empty_after_cleanup_skipped(self) -> None:
         rows: Final[list[dict[str, object]]] = [

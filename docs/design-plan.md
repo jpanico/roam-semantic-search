@@ -224,8 +224,10 @@ Findings beyond the raw numbers:
 1. **Model choice.** `nomic-embed-text` is the default candidate; worth a
    small side-by-side (e.g. vs `mxbai-embed-large`) on real SCFH queries
    during Phase 1.
-2. **Daily notes in or out?** Default plan: out (journal noise vs. book
-   content), reversible by config.
+2. **Daily notes in or out?** RESOLVED 2026-08-05: in by default
+   (`--no-daily-notes` opts out). Daily notes turned out to hold real project
+   content — e.g. Emi's thumbnail-sketch reviews — not just journal noise, and
+   their absence made well-matched blocks unfindable.
 3. **Scope of block-ref resolution in normalize** — resolve one level only,
    or recursively with a depth cap?
 

@@ -102,7 +102,7 @@ def refresh_store(
     db_path: Path,
     api_endpoint: ApiEndpoint,
     ollama_url: str = DEFAULT_OLLAMA_URL,
-    include_daily_notes: bool = False,
+    include_daily_notes: bool = True,
 ) -> RefreshSummary:
     """Plan and apply an incremental refresh against a store.
 

@@ -3,7 +3,7 @@
 Turns the full-graph fetch's pull-block rows into :class:`IndexRecord` values: breadcrumb
 context assembled from each block's ancestor chain, source markup cleaned down to plain
 prose, block references resolved to their target's text (one level), and skip rules
-applied (system pages, daily notes by default, blocks left empty by cleanup).
+applied (system pages, daily notes on request, blocks left empty by cleanup).
 
 Public symbols:
 
@@ -223,7 +223,7 @@ def _hashed(embed_input: str) -> str:
 
 
 @validate_call
-def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: bool = False) -> list[IndexRecord]:
+def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: bool = True) -> list[IndexRecord]:
     """Derive the embeddable index records from full-graph pull-block rows.
 
     Produces one record per indexable page (its title as text) and one per indexable

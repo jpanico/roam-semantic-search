@@ -28,8 +28,8 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
   ancestor block texts, root-first (ordered by ancestor count, never by wire order,
   which is creation order and diverges from depth on ~12% of nested blocks).
   Roam markup is cleaned to prose (`[[refs]]` → text, `((uid))` references resolve
-  to their target's text one level deep); `roam/js`, `roam/css`, and daily-note
-  pages are skipped (daily notes can be included with `--daily-notes`).
+  to their target's text one level deep); `roam/js` and `roam/css` pages are
+  skipped, and daily-note pages are indexed (skippable with `--no-daily-notes`).
 - **Embed** — a local [Ollama](https://ollama.com) server running
   `nomic-embed-text` (768-dim), with the model's `search_document:` /
   `search_query:` retrieval prefixes. Loopback-only, enforced.
