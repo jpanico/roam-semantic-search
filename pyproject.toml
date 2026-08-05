@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "roam-semantic-search"
 version = "0.1.0"
 description = "Fully local semantic search over a Roam Research graph: Local API fetch, local embeddings, hybrid retrieval"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
     "guffin",
