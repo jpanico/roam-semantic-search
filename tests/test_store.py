@@ -8,6 +8,7 @@ from numpy.typing import NDArray
 
 from roam_semantic_search.normalize import IndexRecord
 from roam_semantic_search.store import (
+    SCHEMA_VERSION,
     StoreMeta,
     delete_records,
     keyword_ranked_uids,
@@ -21,12 +22,21 @@ from roam_semantic_search.store import (
 )
 
 
-def _record(uid: str, text: str) -> IndexRecord:
+def _record(
+    uid: str,
+    text: str,
+    concepts: tuple[str, ...] = (),
+    tags: tuple[str, ...] = (),
+    descendant_text: str = "",
+) -> IndexRecord:
     return IndexRecord(
         uid=uid,
         page_title="P",
         breadcrumb=f"P › {text}",
         text=text,
+        concepts=concepts,
+        tags=tags,
+        descendant_text=descendant_text,
         embed_input=f"P › {text}",
         content_hash="0" * 64,
         edited_at=1000,
@@ -73,6 +83,11 @@ class TestStoreRoundTrip:
         _built_store(db_path)
         assert keyword_ranked_uids(db_path, 'hippo AND "NEAR(', 10) == ["uid000001"]
 
+    def test_schema_version_stamped(self, tmp_path: Path) -> None:
+        db_path: Final[Path] = tmp_path / "test.db"
+        _built_store(db_path)
+        assert read_meta(db_path).schema_version == SCHEMA_VERSION
+
     def test_records_read_back(self, tmp_path: Path) -> None:
         db_path: Final[Path] = tmp_path / "test.db"
         _built_store(db_path)
@@ -91,6 +106,34 @@ class TestStoreRoundTrip:
         write_store(db_path, one, vectors, meta)
         uids, _ = load_embedding_matrix(db_path)
         assert uids == ["uid000009"]
+
+
+class TestWeightedKeywordRanking:
+    def test_concept_match_outranks_tag_match_outranks_text_match(self, tmp_path: Path) -> None:
+        db_path: Final[Path] = tmp_path / "test.db"
+        records: Final[list[IndexRecord]] = [
+            _record("uid0text1", "the hippo swims here"),
+            _record("uid00tag1", "a bird flies", tags=("hippo",)),
+            _record("uid0conc1", "a whale sings", concepts=("hippo",)),
+        ]
+        vectors: Final[NDArray[np.float32]] = np.zeros((3, 3), dtype=np.float32)
+        meta: Final[StoreMeta] = StoreMeta(
+            graph_name="G", embed_model="m", dimension=3, built_at="2026-08-05T00:00:00+00:00", record_count=3
+        )
+        write_store(db_path, records, vectors, meta)
+        assert keyword_ranked_uids(db_path, "hippo", 10) == ["uid0conc1", "uid00tag1", "uid0text1"]
+
+    def test_descendant_text_matches_at_base_weight(self, tmp_path: Path) -> None:
+        db_path: Final[Path] = tmp_path / "test.db"
+        records: Final[list[IndexRecord]] = [
+            _record("uid0desc1", "a parent block", descendant_text="the hippo swims below"),
+        ]
+        vectors: Final[NDArray[np.float32]] = np.zeros((1, 3), dtype=np.float32)
+        meta: Final[StoreMeta] = StoreMeta(
+            graph_name="G", embed_model="m", dimension=3, built_at="2026-08-05T00:00:00+00:00", record_count=1
+        )
+        write_store(db_path, records, vectors, meta)
+        assert keyword_ranked_uids(db_path, "hippo", 10) == ["uid0desc1"]
 
 
 class TestStoreMutation:

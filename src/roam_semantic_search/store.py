@@ -8,6 +8,10 @@ a matrix product answers in milliseconds), so no SQLite extension is required.
 
 Public symbols:
 
+- :data:`SCHEMA_VERSION` — the store layout's version, stamped into the meta.
+- :data:`BM25_WEIGHT_TEXT` / :data:`BM25_WEIGHT_BREADCRUMB` / :data:`BM25_WEIGHT_CONCEPTS` /
+  :data:`BM25_WEIGHT_TAGS` / :data:`BM25_WEIGHT_DESCENDANT_TEXT` — the keyword ranking's
+  per-column BM25 weights.
 - :class:`StoreMeta` — the store's provenance and embedding-model facts.
 - :class:`StoredRecord` — one record read back from the store.
 - :func:`default_db_path` — the conventional store location for a graph.
@@ -22,6 +26,7 @@ Public symbols:
 - :func:`records_by_uid` — read back records by uid.
 """
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -37,6 +42,24 @@ from roam_semantic_search.normalize import IndexRecord
 
 _WORD_RE: Final[regex.Pattern[str]] = regex.compile(r"\w+")
 
+SCHEMA_VERSION: Final[int] = 2
+"""The store layout's version, stamped into the meta; a mismatched store needs a full rebuild."""
+
+BM25_WEIGHT_TEXT: Final[float] = 1.0
+"""Keyword-ranking weight of a record's own text (the base word weight)."""
+
+BM25_WEIGHT_BREADCRUMB: Final[float] = 1.0
+"""Keyword-ranking weight of a record's context path."""
+
+BM25_WEIGHT_CONCEPTS: Final[float] = 4.0
+"""Keyword-ranking weight of a record's referenced page names (the highest tier)."""
+
+BM25_WEIGHT_TAGS: Final[float] = 2.0
+"""Keyword-ranking weight of a record's ``tags::`` classification values (the middle tier)."""
+
+BM25_WEIGHT_DESCENDANT_TEXT: Final[float] = 1.0
+"""Keyword-ranking weight of a record's folded descendant text (the base word weight)."""
+
 _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
     "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
     """
@@ -45,6 +68,9 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         page_title TEXT NOT NULL,
         breadcrumb TEXT NOT NULL,
         text TEXT NOT NULL,
+        concepts TEXT NOT NULL,
+        tags TEXT NOT NULL,
+        descendant_text TEXT NOT NULL,
         embed_input TEXT NOT NULL,
         content_hash TEXT NOT NULL,
         edited_at INTEGER NOT NULL,
@@ -52,7 +78,7 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         embedding BLOB NOT NULL
     )
     """,
-    "CREATE VIRTUAL TABLE records_fts USING fts5(text, breadcrumb, uid UNINDEXED)",
+    "CREATE VIRTUAL TABLE records_fts USING fts5(text, breadcrumb, concepts, tags, descendant_text, uid UNINDEXED)",
 )
 
 
@@ -66,6 +92,7 @@ class StoreMeta(BaseModel):
         built_at: ISO-8601 moment the store was fully built.
         record_count: Number of records in the store.
         refreshed_at: ISO-8601 moment of the latest incremental refresh, when one has run.
+        schema_version: The store layout's version; ``None`` for a store predating versioning.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -76,6 +103,7 @@ class StoreMeta(BaseModel):
     built_at: str
     record_count: int
     refreshed_at: str | None = None
+    schema_version: int | None = None
 
 
 class StoredRecord(BaseModel):
@@ -131,6 +159,9 @@ def write_store(
     """
     if len(records) != embeddings.shape[0]:
         raise ValueError(f"{len(records)} records but {embeddings.shape[0]} embeddings")
+    stamped_meta: Final[StoreMeta] = (
+        meta if meta.schema_version is not None else meta.model_copy(update={"schema_version": SCHEMA_VERSION})
+    )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_path.unlink(missing_ok=True)
     connection: Final[sqlite3.Connection] = sqlite3.connect(db_path)
@@ -140,15 +171,16 @@ def write_store(
                 connection.execute(statement)
             connection.executemany(
                 "INSERT INTO meta (key, value) VALUES (?, ?)",
-                [(key, str(value)) for key, value in meta.model_dump().items() if value is not None],
+                [(key, str(value)) for key, value in stamped_meta.model_dump().items() if value is not None],
             )
             connection.executemany(
-                "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _record_rows(records, embeddings),
             )
             connection.executemany(
-                "INSERT INTO records_fts (text, breadcrumb, uid) VALUES (?, ?, ?)",
-                [(record.text, record.breadcrumb, record.uid) for record in records],
+                "INSERT INTO records_fts (text, breadcrumb, concepts, tags, descendant_text, uid)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                _fts_rows(records),
             )
     finally:
         connection.close()
@@ -156,7 +188,7 @@ def write_store(
 
 def _record_rows(
     records: Sequence[IndexRecord], embeddings: NDArray[np.float32]
-) -> list[tuple[str, str, str, str, str, str, int, int, bytes]]:
+) -> list[tuple[str, str, str, str, str, str, str, str, str, int, int, bytes]]:
     """The ``records`` table's row tuples for *records*, embeddings row-aligned."""
     return [
         (
@@ -164,6 +196,9 @@ def _record_rows(
             record.page_title,
             record.breadcrumb,
             record.text,
+            json.dumps(list(record.concepts)),
+            json.dumps(list(record.tags)),
+            record.descendant_text,
             record.embed_input,
             record.content_hash,
             record.edited_at,
@@ -171,6 +206,21 @@ def _record_rows(
             embeddings[row_index].tobytes(),
         )
         for row_index, record in enumerate(records)
+    ]
+
+
+def _fts_rows(records: Sequence[IndexRecord]) -> list[tuple[str, str, str, str, str, str]]:
+    """The FTS mirror's row tuples for *records* (list fields joined as plain text)."""
+    return [
+        (
+            record.text,
+            record.breadcrumb,
+            " · ".join(record.concepts),
+            " · ".join(record.tags),
+            record.descendant_text,
+            record.uid,
+        )
+        for record in records
     ]
 
 
@@ -199,13 +249,14 @@ def upsert_records(
     try:
         with connection:
             connection.executemany(
-                "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO records VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 _record_rows(records, embeddings),
             )
             connection.executemany("DELETE FROM records_fts WHERE uid = ?", [(record.uid,) for record in records])
             connection.executemany(
-                "INSERT INTO records_fts (text, breadcrumb, uid) VALUES (?, ?, ?)",
-                [(record.text, record.breadcrumb, record.uid) for record in records],
+                "INSERT INTO records_fts (text, breadcrumb, concepts, tags, descendant_text, uid)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                _fts_rows(records),
             )
     finally:
         connection.close()
@@ -311,10 +362,13 @@ def load_embedding_matrix(db_path: Path) -> tuple[list[str], NDArray[np.float32]
 
 @validate_call
 def keyword_ranked_uids(db_path: Path, query_text: str, limit: int) -> list[str]:
-    """BM25-ranked uids for a query's terms, best first.
+    """BM25-ranked uids for a query's terms, best first, per-column weighted.
 
     The query's word tokens are OR-joined as quoted FTS5 terms, so natural-language
-    queries need no FTS syntax and cannot trip over it.
+    queries need no FTS syntax and cannot trip over it.  Ranking weighs where a term
+    matches: a record's referenced page names (:data:`BM25_WEIGHT_CONCEPTS`) over its
+    ``tags::`` values (:data:`BM25_WEIGHT_TAGS`) over its own, breadcrumb, and
+    descendant text (the base weights).
 
     Args:
         db_path: The store's database file.
@@ -328,11 +382,15 @@ def keyword_ranked_uids(db_path: Path, query_text: str, limit: int) -> list[str]
     if not tokens:
         return []
     match_expression: Final[str] = " OR ".join(f'"{token}"' for token in tokens)
+    ranking_expression: Final[str] = (
+        f"bm25(records_fts, {BM25_WEIGHT_TEXT}, {BM25_WEIGHT_BREADCRUMB},"
+        f" {BM25_WEIGHT_CONCEPTS}, {BM25_WEIGHT_TAGS}, {BM25_WEIGHT_DESCENDANT_TEXT})"
+    )
     connection: Final[sqlite3.Connection] = sqlite3.connect(db_path)
     try:
         rows: Final[list[tuple[str]]] = list(
             connection.execute(
-                "SELECT uid FROM records_fts WHERE records_fts MATCH ? ORDER BY rank LIMIT ?",
+                f"SELECT uid FROM records_fts WHERE records_fts MATCH ? ORDER BY {ranking_expression} LIMIT ?",
                 (match_expression, limit),
             )
         )

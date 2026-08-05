@@ -30,6 +30,12 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
   Roam markup is cleaned to prose (`[[refs]]` → text, `((uid))` references resolve
   to their target's text one level deep); `roam/js` and `roam/css` pages are
   skipped, and daily-note pages are indexed (skippable with `--no-daily-notes`).
+  Each record also carries **retrieval emphasis** in three weight tiers: the page
+  names its own text references (`[[Page]]` and `#tag` alike — its *concepts*,
+  highest), its direct-child `tags::` values (its *tags*, middle), and its plain
+  words plus its whole subtree's folded text (base). The keyword leg realizes the
+  tiers as per-column BM25 weights (4/2/1); the vector leg by embed-input
+  composition (labeled concept/tag segments, descendant text truncated first).
 - **Embed** — a local [Ollama](https://ollama.com) server running
   `nomic-embed-text` (768-dim), with the model's `search_document:` /
   `search_query:` retrieval prefixes. Loopback-only, enforced.

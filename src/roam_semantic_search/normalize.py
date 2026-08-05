@@ -2,8 +2,11 @@
 
 Turns the full-graph fetch's pull-block rows into :class:`IndexRecord` values: breadcrumb
 context assembled from each block's ancestor chain, source markup cleaned down to plain
-prose, block references resolved to their target's text (one level), and skip rules
-applied (system pages, daily notes on request, blocks left empty by cleanup).
+prose, block references resolved to their target's text (one level), retrieval emphasis
+extracted — the page names the entity's own text references (its *concepts*) and its
+direct-child ``tags::`` values (its *tags*) — descendant block text folded in document
+order, and skip rules applied (system pages, daily notes on request, blocks left empty
+by cleanup).
 
 Public symbols:
 
@@ -52,6 +55,7 @@ _HASH_BRACKET_RE: Final[regex.Pattern[str]] = regex.compile(r"#(?=\[\[)")
 _PAGE_REF_RE: Final[regex.Pattern[str]] = regex.compile(r"\[\[([^\[\]]*)\]\]")
 _HASHTAG_RE: Final[regex.Pattern[str]] = regex.compile(r"#([\w-]+)")
 _ATTRIBUTE_HEAD_RE: Final[regex.Pattern[str]] = regex.compile(r"^([^:\n`]+)::\s*")
+_TAGS_ATTRIBUTE_RE: Final[regex.Pattern[str]] = regex.compile(r"^tags::\s*(?P<values>.*)$", regex.DOTALL)
 _CODE_FENCE_RE: Final[regex.Pattern[str]] = regex.compile(r"```[\w+-]*")
 _WHITESPACE_RUN_RE: Final[regex.Pattern[str]] = regex.compile(r"\s+")
 
@@ -66,7 +70,16 @@ class IndexRecord(BaseModel):
         page_title: Title of the page the entity belongs to (the page's own title for a page).
         breadcrumb: Context path — page title, then ancestor block texts root-first.
         text: The entity's own cleaned plain text (the title, for a page).
-        embed_input: What gets embedded and content-hashed: breadcrumb joined with text.
+        concepts: Names of the pages the entity's own text references — ``[[Page Name]]``
+            and ``#tag`` spellings alike, every nesting level of a nested reference —
+            in encounter order, deduplicated.
+        tags: Values of the entity's direct-child ``tags::`` attribute blocks — the
+            entity's explicit classification — in document order, deduplicated.
+        descendant_text: Every descendant block's cleaned text, depth-first in document
+            order, joined.
+        embed_input: What gets embedded and content-hashed: context + own text, the
+            concept and tag emphasis segments, then descendant text — priority-ordered
+            so the length cap cuts the lowest-priority content first.
         content_hash: SHA-256 hex digest of ``embed_input``.
         edited_at: The entity's latest bookkeeping timestamp (epoch ms; create/edit maximum).
         is_page: Whether the record represents a page rather than a block.
@@ -78,6 +91,9 @@ class IndexRecord(BaseModel):
     page_title: str
     breadcrumb: str
     text: str
+    concepts: tuple[str, ...]
+    tags: tuple[str, ...]
+    descendant_text: str
     embed_input: str
     content_hash: str
     edited_at: int
@@ -217,6 +233,131 @@ def _breadcrumb(
     return f"{page_title} › {' · '.join(segments)}"
 
 
+def _page_ref_names(raw_text: str, ref_texts: Mapping[str, str]) -> tuple[str, ...]:
+    """Every page name a source markup string references, in encounter order, deduplicated.
+
+    Both reference spellings count — ``[[Page Name]]`` (with its ``#[[...]]`` variant) and
+    ``#tag`` — since both reference a page.  A nested reference yields every level,
+    innermost first (``[[[[A]] B]]`` names both ``A`` and ``A B``).  An attribute head and
+    ``#c:`` color tags are not references; each name is cleaned to plain text, and names
+    left empty by cleaning drop.
+
+    Args:
+        raw_text: The source markup string.
+        ref_texts: Plain-text-by-uid map a block reference resolves through.
+
+    Returns:
+        The referenced page names, cleaned, deduplicated, in encounter order.
+    """
+    text = _COLOR_TAG_RE.sub("", raw_text)
+    text = _ATTRIBUTE_HEAD_RE.sub("", text)
+    text = _HASH_BRACKET_RE.sub("", text)
+    names: Final[list[str]] = []
+    while (match := _PAGE_REF_RE.search(text)) is not None:
+        names.append(match.group(1))
+        text = text[: match.start()] + match.group(1) + text[match.end() :]
+    names.extend(_HASHTAG_RE.findall(text))
+    cleaned: Final[list[str]] = [_plain_text(name, ref_texts) for name in names]
+    return tuple(dict.fromkeys(name for name in cleaned if name))
+
+
+def _ordered_children(
+    row: Mapping[str, object], by_dbid: Mapping[int, Mapping[str, object]]
+) -> list[Mapping[str, object]]:
+    """A row's direct-child rows in sibling order (each child's ``order`` block property)."""
+    children: Final[list[Mapping[str, object]]] = [
+        by_dbid[stub_id] for stub_id in _stub_ids(row, "children") if stub_id in by_dbid
+    ]
+    return sorted(children, key=lambda child: _int_field(child, "order"))
+
+
+def _tag_names(
+    row: Mapping[str, object],
+    by_dbid: Mapping[int, Mapping[str, object]],
+    ref_texts: Mapping[str, str],
+) -> tuple[str, ...]:
+    """The values of a row's direct-child ``tags::`` attribute blocks, deduplicated.
+
+    Each ``tags::`` child contributes its referenced page names (reference and hashtag
+    spellings alike); a child whose value text references no page falls back to its
+    comma-separated plain tokens.
+
+    Args:
+        row: The pull-block row whose tags are read.
+        by_dbid: Every row keyed by its entity id.
+        ref_texts: Plain-text-by-uid map a block reference resolves through.
+
+    Returns:
+        The tag values, deduplicated, in document order.
+    """
+    names: Final[list[str]] = []
+    for child in _ordered_children(row, by_dbid):
+        raw: str | None = _str_field(child, "string")
+        if raw is None:
+            continue
+        match: regex.Match[str] | None = _TAGS_ATTRIBUTE_RE.match(raw)
+        if match is None:
+            continue
+        values: str = match.group("values")
+        ref_names: tuple[str, ...] = _page_ref_names(values, ref_texts)
+        if ref_names:
+            names.extend(ref_names)
+            continue
+        names.extend(token.strip() for token in values.split(",") if token.strip())
+    return tuple(dict.fromkeys(names))
+
+
+def _descendant_texts(
+    row: Mapping[str, object],
+    by_dbid: Mapping[int, Mapping[str, object]],
+    cleaned_by_dbid: Mapping[int, str],
+) -> list[str]:
+    """Every descendant block's cleaned text under a row, depth-first in document order.
+
+    Args:
+        row: The pull-block row whose subtree is folded.
+        by_dbid: Every row keyed by its entity id.
+        cleaned_by_dbid: Each row's cleaned plain text, keyed by entity id.
+
+    Returns:
+        The descendant texts, document-ordered; descendants left empty by cleaning drop.
+    """
+    texts: Final[list[str]] = []
+    for child in _ordered_children(row, by_dbid):
+        child_id: object = child.get("id")
+        child_text: str = cleaned_by_dbid.get(child_id, "") if isinstance(child_id, int) else ""
+        if child_text:
+            texts.append(child_text)
+        texts.extend(_descendant_texts(child, by_dbid, cleaned_by_dbid))
+    return texts
+
+
+def _embed_input(lead: str, concepts: Sequence[str], tags: Sequence[str], descendant_text: str) -> str:
+    """Assemble a record's embeddable input, priority-ordered under the length cap.
+
+    The lead (context + own text) comes first, then the concept and tag emphasis
+    segments, then the descendant text — so truncation at :data:`EMBED_INPUT_MAX_CHARS`
+    cuts the lowest-priority content first.  Empty segments are absent.
+
+    Args:
+        lead: The record's context and own text.
+        concepts: The record's referenced page names.
+        tags: The record's ``tags::`` classification values.
+        descendant_text: The record's folded descendant text.
+
+    Returns:
+        The embeddable input, capped at :data:`EMBED_INPUT_MAX_CHARS`.
+    """
+    segments: Final[list[str]] = [lead]
+    if concepts:
+        segments.append("concepts: " + " · ".join(concepts))
+    if tags:
+        segments.append("tags: " + " · ".join(tags))
+    if descendant_text:
+        segments.append(descendant_text)
+    return " | ".join(segments)[:EMBED_INPUT_MAX_CHARS]
+
+
 def _hashed(embed_input: str) -> str:
     """SHA-256 hex digest of an embeddable input."""
     return hashlib.sha256(embed_input.encode()).hexdigest()
@@ -228,7 +369,10 @@ def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: b
 
     Produces one record per indexable page (its title as text) and one per indexable
     block: blocks of skipped pages are skipped with them, and a block whose cleanup
-    leaves no text (pure-markup or empty) yields no record.
+    leaves no text (pure-markup or empty) yields no record.  Each record also carries
+    its retrieval emphasis — the page names its own text references (``concepts``) and
+    its direct-child ``tags::`` values (``tags``) — plus its whole subtree's cleaned
+    text (``descendant_text``), document-ordered.
 
     Args:
         rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
@@ -245,6 +389,13 @@ def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: b
 
     ref_texts: Final[dict[str, str]] = _reference_texts(rows)
 
+    cleaned_by_dbid: Final[dict[int, str]] = {}
+    for row in rows:
+        raw_string: str | None = _str_field(row, "string")
+        cleaned_row_id: object = row.get("id")
+        if raw_string is not None and isinstance(cleaned_row_id, int):
+            cleaned_by_dbid[cleaned_row_id] = _plain_text(raw_string, ref_texts)
+
     page_records: Final[list[IndexRecord]] = []
     indexable_page_dbids: Final[set[int]] = set()
     for row in rows:
@@ -257,13 +408,19 @@ def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: b
             indexable_page_dbids.add(row_id)
         # The raw title stays the display identity; markup is cleaned out of what embeds.
         title_text: str = _plain_text(title, ref_texts) or title
-        embed_input: str = title_text[:EMBED_INPUT_MAX_CHARS]
+        page_concepts: tuple[str, ...] = _page_ref_names(title, ref_texts)
+        page_tags: tuple[str, ...] = _tag_names(row, by_dbid, ref_texts)
+        page_descendant_text: str = " · ".join(_descendant_texts(row, by_dbid, cleaned_by_dbid))
+        embed_input: str = _embed_input(title_text, page_concepts, page_tags, page_descendant_text)
         page_records.append(
             IndexRecord(
                 uid=uid,
                 page_title=title,
                 breadcrumb=title_text,
                 text=title_text,
+                concepts=page_concepts,
+                tags=page_tags,
+                descendant_text=page_descendant_text,
                 embed_input=embed_input,
                 content_hash=_hashed(embed_input),
                 edited_at=max(_int_field(row, "time"), _int_field(row, "edit-time")),
@@ -283,17 +440,26 @@ def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: b
         page_row: dict[str, object] = by_dbid[page_id]
         page_title: str = _str_field(page_row, "title") or ""
         page_title_text: str = _plain_text(page_title, ref_texts) or page_title
-        text: str = _plain_text(raw, ref_texts)
+        block_row_id: object = row.get("id")
+        text: str = cleaned_by_dbid[block_row_id] if isinstance(block_row_id, int) else _plain_text(raw, ref_texts)
         if not text:
             continue
         breadcrumb: str = _breadcrumb(row, page_title_text, by_dbid, ref_texts)
-        block_embed_input: str = f"{breadcrumb} › {text}"[:EMBED_INPUT_MAX_CHARS]
+        block_concepts: tuple[str, ...] = _page_ref_names(raw, ref_texts)
+        block_tags: tuple[str, ...] = _tag_names(row, by_dbid, ref_texts)
+        block_descendant_text: str = " · ".join(_descendant_texts(row, by_dbid, cleaned_by_dbid))
+        block_embed_input: str = _embed_input(
+            f"{breadcrumb} › {text}", block_concepts, block_tags, block_descendant_text
+        )
         block_records.append(
             IndexRecord(
                 uid=uid_value,
                 page_title=page_title,
                 breadcrumb=breadcrumb,
                 text=text,
+                concepts=block_concepts,
+                tags=block_tags,
+                descendant_text=block_descendant_text,
                 embed_input=block_embed_input,
                 content_hash=_hashed(block_embed_input),
                 edited_at=max(_int_field(row, "time"), _int_field(row, "edit-time")),

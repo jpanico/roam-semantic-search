@@ -233,6 +233,19 @@ Findings beyond the raw numbers:
 
 ## Decision log
 
+- **2026-08-05 — Concept-weighted indexing (schema v2).** Words are not equal:
+  a `[[Page]]`/`#tag` reference in a block's own text names a well-identified
+  concept (highest weight), a direct-child `tags::` value is the user's explicit
+  classification of the block (middle), and everything else — own text plus the
+  whole descendant subtree's folded words, full depth — is base weight. The
+  keyword leg realizes the tiers as FTS5 per-column BM25 weights (4/2/1); the
+  vector leg by embed-input composition (labeled `concepts:`/`tags:` segments,
+  descendant text last so the length cap cuts it first). Motivating case: the
+  Hedge Maze thumbnail-sketch review `((JOqXHpSTE))` — `[[Emi]]` ref +
+  `tags:: #Illustration` child — ranked #239 vector / #218 keyword for
+  "Emi illustration illustrator" and was unfindable; after the change it fuses
+  into the top dozen. Requires a full `build` (the refresh guard rejects a
+  mismatched `schema_version`).
 - **2026-08-04 — Roam server-side embeddings rejected.** Roam's opt-in
   embeddings feature would have Roam's servers compute embeddings over
   decrypted SCFH content. Declined on privacy grounds; this project exists

@@ -31,6 +31,7 @@ from roam_semantic_search.embed import DEFAULT_OLLAMA_URL, embed_texts
 from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.normalize import IndexRecord, normalized_records
 from roam_semantic_search.store import (
+    SCHEMA_VERSION,
     StoreMeta,
     delete_records,
     read_meta,
@@ -120,8 +121,17 @@ def refresh_store(
 
     Returns:
         The refresh summary.
+
+    Raises:
+        ValueError: If the store's schema version is not the current one (a full
+            rebuild is required — an incremental refresh cannot migrate the layout).
     """
     meta: Final[StoreMeta] = read_meta(db_path)
+    if meta.schema_version != SCHEMA_VERSION:
+        raise ValueError(
+            f"store schema v{meta.schema_version} does not match current v{SCHEMA_VERSION}"
+            " — rebuild the index with `roam-semantic-search build`"
+        )
     rows: Final[list[dict[str, object]]] = fetch_graph(api_endpoint)
     records: Final[list[IndexRecord]] = normalized_records(rows, include_daily_notes=include_daily_notes)
     plan: Final[RefreshPlan] = refresh_plan(records, stored_hashes(db_path))
