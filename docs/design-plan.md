@@ -204,8 +204,10 @@ roam-semantic-search/
   `~/Library/Logs/roam-semantic-search/refresh-brain.log`. No env in the plist —
   credentials resolve from Roam's registry (Phase 4a), which is what makes the
   agent this small. No `KeepAlive`: a run without Roam Desktop or Ollama fails
-  cleanly and the next interval catches up. SCFH deliberately has no agent yet —
-  add a sibling plist if wanted.
+  cleanly and the next interval catches up. A sibling agent
+  `dev.roam-semantic-search.refresh-scfh` (added later the same day) refreshes
+  SCFH on the same hourly cadence, keeping the two indexes' staleness bounds in
+  parity.
 - **Phase 4 (optional, demand-driven):** result reranking.
 
 ## Phase 0 results (2026-08-04, live SCFH)
