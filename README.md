@@ -53,8 +53,8 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
 
 ## Requirements
 
-- **Roam Desktop** running locally with the Local API enabled (port, graph name,
-  and a bearer token from Roam → Settings)
+- **Roam Desktop** running locally with the Local API enabled, and each graph you
+  want to index **connected** (Roam records the connection; see *Graphs* below)
 - **Ollama** with the embedding model pulled: `ollama pull nomic-embed-text`
   (`brew services start ollama` keeps it running at login)
 - **Python ≥ 3.14** and a sibling checkout of
@@ -68,26 +68,67 @@ python3.14 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+## Graphs
+
+Several Roam graphs are typically connected at once, so **every command names the graph
+it operates on**. A graph is named by the nickname it was connected under, or by its
+canonical Roam name:
+
+```bash
+roam-semantic-search graphs             # what's connected, and what's indexed
+```
+```
+scfh         SCFH         hosted   indexed (9392 records)
+brain        hippo        hosted   not indexed
+apple        Apple        offline  not indexed
+```
+
+Nicknames, canonical names, per-graph bearer tokens, and the Local API port are read from
+Roam's own config files, so this project stores no graph configuration of its own:
+
+| File | Contents |
+|---|---|
+| `~/.roam-local-api.json` | `{"port": 3333}` — **one port serves every graph**, not one per graph |
+| `~/.roam-tools.json` | A `graphs` array of `{name, nickname, token, type, …}`, written when a graph is connected |
+
+Each index lives at `~/.cache/roam-semantic-search/<canonical-name>.db` — keyed by the
+canonical name, never the nickname, so the CLI and MCP server always address the same file.
+
+**Offline graphs** (registry `type` of `offline` rather than `hosted`) cannot be indexed:
+the `/api/<name>` Local API path serves hosted graphs only, and rejects them with *"Token
+is valid for offline graph … not hosted"*. They appear in `graphs` but `build` refuses
+them with that explanation.
+
 ## Configuration
 
-The CLI and MCP server read the same environment the guffin tools use:
+Graph identity and credentials come from the files above. The remaining environment
+variables tune everything else, and are all optional:
 
 | Variable | Meaning |
 |---|---|
-| `GUFFIN_ROAM_LOCAL_API_PORT` | Roam Local API port (backs `--port`/`-p`) |
-| `GUFFIN_ROAM_GRAPH_NAME` | Graph name (backs `--graph`/`-g`; also names the default DB) |
-| `GUFFIN_ROAM_API_TOKEN` | Local API bearer token (backs `--token`/`-t`) |
-| `ROAM_SEMANTIC_SEARCH_DB` | Explicit index DB path (else `~/.cache/roam-semantic-search/<graph>.db`) |
 | `ROAM_SEMANTIC_SEARCH_OLLAMA_URL` | Embedding server URL (default `http://127.0.0.1:11434`; must be loopback) |
+| `ROAM_SEMANTIC_SEARCH_MAX_STALENESS` | MCP `semantic_search` auto-refresh threshold, seconds (default 3600; negative disables) |
+| `GUFFIN_ROAM_LOCAL_API_PORT` | Overrides the port from `~/.roam-local-api.json` (backs `--port`/`-p`) |
+| `GUFFIN_ROAM_API_TOKEN` | Overrides the graph's registry token (backs `--token`/`-t`) |
+| `GUFFIN_ROAM_GRAPH_NAME` | Default value for `--graph`; a nickname or canonical name |
+| `ROAM_SEMANTIC_SEARCH_DB` | Explicit index DB path for a CLI command (backs `--db`) |
+
+An explicit flag always wins, then the registry, then the environment. The registry is
+preferred over `GUFFIN_ROAM_API_TOKEN` deliberately: that variable names one default
+graph, and its token is the wrong credential for any other.
 
 ## CLI
 
 ```bash
-roam-semantic-search build              # full fetch → normalize → embed → store (~100 s for ~8k records)
-roam-semantic-search refresh            # incremental: re-embed only what changed (~2 s when idle)
-roam-semantic-search search "why the human must stay responsible" -k 5
-roam-semantic-search stats              # store provenance: model, counts, build/refresh moments
+roam-semantic-search graphs                       # connected graphs and their index state
+roam-semantic-search build --graph brain          # full fetch → normalize → embed → store (~100 s for ~8k records)
+roam-semantic-search refresh --graph brain        # incremental: re-embed only what changed (~2 s when idle)
+roam-semantic-search search --graph scfh "why the human must stay responsible" -k 5
+roam-semantic-search stats --graph scfh           # store provenance: model, counts, build/refresh moments
 ```
+
+`--port` and `--token` are needed only to override the registry, or to reach a graph it
+does not know about.
 
 A hit shows the Roam uid (usable as a `((ref))`), the fused score, each ranking's
 position (`v:` vector, `k:` keyword), the breadcrumb, and the text:
@@ -100,17 +141,36 @@ position (`v:` vector, `k:` keyword), the breadcrumb, and the text:
 
 ## MCP server
 
-`roam-semantic-search-mcp` serves the index over stdio to any MCP client, with
-three tools: `semantic_search` (hits plus index meta, so a caller can judge
-staleness), `refresh_index`, and `index_stats`. Register with Claude Code:
+`roam-semantic-search-mcp` serves every connected graph's index over stdio to any MCP
+client, with four tools:
+
+| Tool | Purpose |
+|---|---|
+| `list_indexes` | Connected graphs and which have a searchable index — call first |
+| `semantic_search` | Ranked hits plus index meta; auto-refreshes a stale index first |
+| `refresh_index` | Incremental refresh from the live graph, on demand |
+| `index_stats` | One store's provenance |
+
+**Staleness is bounded, and never silent.** `semantic_search` answers from the index — a
+snapshot — but when the last capture is older than the staleness threshold
+(`ROAM_SEMANTIC_SEARCH_MAX_STALENESS`, default one hour) it refreshes the index before
+searching. A failed refresh (most commonly Roam Desktop not running) degrades gracefully
+to the snapshot. Either way the response's `refresh` field reports what happened —
+`fresh`, `refreshed`, `refresh-failed` (with the error), or `disabled` — so a caller who
+cares about currency checks one field instead of doing timestamp arithmetic.
+
+Register with Claude Code — no per-graph configuration, since the server reads Roam's
+registry directly:
 
 ```bash
-claude mcp add --scope user roam-semantic-search --env GUFFIN_ROAM_GRAPH_NAME=<graph> -- $(pwd)/.venv/bin/roam-semantic-search-mcp
+claude mcp add --scope user roam-semantic-search -- $(pwd)/.venv/bin/roam-semantic-search-mcp
 ```
 
-The Local API port and token are inherited from the shell environment rather than
-stored in the client's config; without them `refresh_index` fails cleanly while
-search keeps working.
+**`semantic_search`, `refresh_index`, and `index_stats` each require a `graph`
+argument.** That is deliberate rather than an ergonomic oversight: with several graphs
+connected, a server-wide default would silently answer from whichever graph the process
+happened to be configured for — a wrong answer that reads exactly like a right one.
+`list_indexes` exists so a caller can discover the legal values instead of guessing.
 
 ## Development
 

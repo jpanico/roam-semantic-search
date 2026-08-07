@@ -158,8 +158,9 @@ roam-semantic-search/
 │   ├── embed.py              # Ollama client (localhost only), model/dim handshake
 │   ├── store.py              # SQLite + sqlite-vec + FTS5 schema and upserts
 │   ├── query.py              # hybrid retrieval + RRF (pure; no MCP/CLI deps)
+│   ├── graph_registry.py     # Roam's connected graphs: nickname → name, port, token
 │   ├── mcp_server.py         # stdio MCP front end
-│   └── cli.py                # typer front end (build / refresh / search)
+│   └── cli.py                # typer front end (graphs / build / refresh / search / stats)
 └── tests/
 ```
 
@@ -181,15 +182,31 @@ roam-semantic-search/
   answers in 1.7 s (0 re-embedded, 7,775 unchanged). Timestamp candidate
   selection was dropped entirely — see the decision log.
 - **Phase 3 — MCP server: DONE 2026-08-05.** `mcp_server.py` (official `mcp`
-  SDK 2.0, `MCPServer`, stdio; entry point `roam-semantic-search-mcp`),
-  configured by env vars (`GUFFIN_ROAM_GRAPH_NAME` or
-  `ROAM_SEMANTIC_SEARCH_DB`). Three tools: `semantic_search` (hits + index
-  meta, so callers can judge staleness), `refresh_index`, `index_stats`.
-  Registered in Claude Code at user scope. The live test also exercised the
-  refresh changed-path for real: 4 re-embedded, 4 deleted, 7,771 unchanged
-  after a day's edits.
-- **Phase 4 (optional, demand-driven):** scheduled refresh; result reranking;
-  additional graphs.
+  SDK 2.0, `MCPServer`, stdio; entry point `roam-semantic-search-mcp`).
+  Three tools: `semantic_search` (hits + index meta, so callers can judge
+  staleness), `refresh_index`, `index_stats`. Registered in Claude Code at user
+  scope. The live test also exercised the refresh changed-path for real: 4
+  re-embedded, 4 deleted, 7,771 unchanged after a day's edits. *Superseded
+  2026-08-07 by the multi-graph work below: the server was configured by env
+  vars (`GUFFIN_ROAM_GRAPH_NAME` / `ROAM_SEMANTIC_SEARCH_DB`) and served exactly
+  one graph; it now reads Roam's registry and requires a `graph` argument.*
+- **Phase 4a — additional graphs: DONE 2026-08-07.** New `graph_registry.py`
+  resolves a nickname through Roam's own config files to a canonical name,
+  the shared Local API port, and that graph's token. Every MCP tool takes a
+  required `graph`; the CLI's `--graph` accepts a nickname or canonical name and
+  derives port and token from it, leaving `--port`/`--token` as overrides. Added
+  `list_indexes` (MCP) and `graphs` (CLI) so callers can discover the legal
+  values. See the decision log for the three findings that shaped it, and for
+  why offline graphs are excluded.
+- **Phase 4b — scheduled refresh (brain): DONE 2026-08-07.** LaunchAgent
+  `dev.roam-semantic-search.refresh-brain` (`~/Library/LaunchAgents/`), hourly
+  (`StartInterval` 3600) plus on load: runs `refresh --graph brain`, logging to
+  `~/Library/Logs/roam-semantic-search/refresh-brain.log`. No env in the plist —
+  credentials resolve from Roam's registry (Phase 4a), which is what makes the
+  agent this small. No `KeepAlive`: a run without Roam Desktop or Ollama fails
+  cleanly and the next interval catches up. SCFH deliberately has no agent yet —
+  add a sibling plist if wanted.
+- **Phase 4 (optional, demand-driven):** result reranking.
 
 ## Phase 0 results (2026-08-04, live SCFH)
 
@@ -233,6 +250,52 @@ Findings beyond the raw numbers:
 
 ## Decision log
 
+- **2026-08-07 — Search-time staleness bound (auto-refresh), not refresh-on-every-search.**
+  `semantic_search` now refreshes the store first *only* when its last capture is older
+  than `ROAM_SEMANTIC_SEARCH_MAX_STALENESS` (default 3600 s; negative disables). Refreshing
+  on every search was rejected: it would add seconds to every query and make search
+  *require* Roam Desktop, whereas the snapshot answers in milliseconds without it. A failed
+  auto-refresh degrades to the snapshot rather than erroring — search's availability must
+  not inherit refresh's dependencies — and every response carries a `refresh` field
+  (`fresh` / `refreshed` / `refresh-failed` + error / `disabled`) so staleness is visible
+  rather than silent. An unknown capture age (unparseable meta timestamp) is treated as
+  stale. The CLI `search` is unchanged: scripted use composes `refresh` explicitly.
+
+- **2026-08-07 — Multi-graph, addressed by nickname; no local config.** Several
+  graphs are connected at once (SCFH, hippo, Apple), so a single-graph server
+  was the wrong shape. Graph identity, the shared Local API port, and per-graph
+  bearer tokens are read from Roam's own files — `~/.roam-local-api.json`
+  (`{"port": 3333}`) and `~/.roam-tools.json` (a `graphs` array) — via the new
+  `graph_registry` module, so this project stores no graph configuration and
+  cannot drift from Roam's. Three findings drove the shape:
+  - **One port serves every graph.** The port lives in its own file and is
+    app-wide; the graph is named by the request path (`/api/<name>`), not by a
+    port of its own. An earlier assumption of per-graph ports was wrong.
+  - **Registry tokens are ordinary Local API tokens**, interchangeable with
+    `GUFFIN_ROAM_API_TOKEN` (a graph may have several minted; all work).
+    Verified by `data.q` returning HTTP 200 under each, against a 401 control.
+    So the registry is preferred over the environment variable, which names one
+    default graph and whose token is the wrong credential for any other.
+  - **Stores key off the canonical name, never the nickname**
+    (`~/.cache/roam-semantic-search/hippo.db` for nickname `brain`), so the CLI
+    and MCP server address the same file for the same graph.
+- **2026-08-07 — The MCP tools require an explicit `graph`; no default.** A
+  server-wide default would silently answer from whichever graph the process was
+  configured for — a wrong answer indistinguishable from a right one, and the
+  connected graphs are comparable in size (SCFH 10,127 entities, hippo 15,334),
+  so nothing about a result would reveal the mistake. Requiring the argument
+  makes the failure mode "you must choose" instead of "you were answered from
+  the wrong graph". `list_indexes` (MCP) and `graphs` (CLI) exist so a caller can
+  discover the legal values rather than guess. Consequence: the server no longer
+  reads `GUFFIN_ROAM_GRAPH_NAME` or `ROAM_SEMANTIC_SEARCH_DB`.
+- **2026-08-07 — Offline graphs are out of scope for now.** A registry entry of
+  `type: offline` (local-only storage) rejects the `/api/<name>` path with
+  *"Token is valid for offline graph … not hosted"*; the correct path is
+  undocumented and probing `/api/offline/<name>` and neighbours returned 404.
+  `graph_registry.api_endpoint_for` refuses such a graph with that explanation
+  rather than letting it surface as an opaque 401. Roam's own MCP server reaches
+  offline graphs, so the answer is recoverable from its source if this becomes
+  worth supporting.
 - **2026-08-05 — Concept-weighted indexing (schema v2).** Words are not equal:
   a `[[Page]]`/`#tag` reference in a block's own text names a well-identified
   concept (highest weight), a direct-child `tags::` value is the user's explicit
