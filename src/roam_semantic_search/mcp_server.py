@@ -17,6 +17,11 @@ graph configuration of its own.  The remaining environment variables are:
 - ``ROAM_SEMANTIC_SEARCH_OLLAMA_URL`` — the local embedding server, when not the default.
 - ``ROAM_SEMANTIC_SEARCH_MAX_STALENESS`` — the auto-refresh staleness threshold, in
   seconds (default 3600); a negative value disables auto-refresh entirely.
+- ``ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW`` — when truthy, an auto-refresh runs only
+  for a graph Roam Desktop already has a window open on.  A Local API request naming a
+  closed graph makes Roam open it, which for an encrypted graph is an unlock prompt: an
+  automatic refresh has no business raising one, so it is skipped and reported instead.
+  An explicit ``refresh_index`` call is never gated — asking for it is deliberate.
 
 A search answers from the index — a snapshot — never from the live graph.  To bound how
 stale an answer can be, ``semantic_search`` first auto-refreshes the index when its last
@@ -40,6 +45,7 @@ from pydantic import BaseModel, ConfigDict, validate_call
 
 from roam_semantic_search.embed import DEFAULT_OLLAMA_URL
 from roam_semantic_search.graph_registry import RegisteredGraph, api_endpoint_for, registered_graphs, resolve_graph
+from roam_semantic_search.graph_windows import WindowState, window_state_for
 from roam_semantic_search.query import SearchHit, search_store
 from roam_semantic_search.refresh import RefreshSummary, refresh_store
 from roam_semantic_search.store import StoreMeta, default_db_path, read_meta
@@ -60,6 +66,8 @@ server: Final[MCPServer] = MCPServer(
 
 DEFAULT_MAX_STALENESS_SECONDS: Final[int] = 3600
 
+_TRUTHY: Final[frozenset[str]] = frozenset({"1", "true", "yes", "on"})
+
 
 class RefreshOutcome(enum.StrEnum):
     """What the pre-search staleness check did."""
@@ -68,6 +76,7 @@ class RefreshOutcome(enum.StrEnum):
     REFRESHED = "refreshed"
     REFRESH_FAILED = "refresh-failed"
     DISABLED = "disabled"
+    WINDOW_CLOSED = "window-closed"
 
 
 class AutoRefresh(BaseModel):
@@ -145,6 +154,12 @@ def _max_staleness_seconds() -> int:
         return DEFAULT_MAX_STALENESS_SECONDS
 
 
+def _require_open_window() -> bool:
+    """Whether an auto-refresh may run only for a graph with an open Roam Desktop window."""
+    raw: Final[str | None] = os.environ.get("ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW")
+    return raw is not None and raw.strip().casefold() in _TRUTHY
+
+
 @validate_call
 def index_age_seconds(meta: StoreMeta, now: datetime) -> float | None:
     """How old a store's last capture is, judged at *now*.
@@ -177,7 +192,9 @@ def _ensured_fresh(graph: str, db_path: Path) -> AutoRefresh:
 
     A failed refresh is an outcome, not an error: search must keep answering from the
     existing snapshot when Roam Desktop is closed, so the failure is reported in the
-    returned outcome rather than raised.
+    returned outcome rather than raised.  Under
+    ``ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW`` a graph with no open window is not
+    refreshed at all, since the attempt would make Roam open one.
     """
     threshold: Final[int] = _max_staleness_seconds()
     if threshold < 0:
@@ -187,8 +204,13 @@ def _ensured_fresh(graph: str, db_path: Path) -> AutoRefresh:
     if age is not None and age <= threshold:
         return AutoRefresh(outcome=RefreshOutcome.FRESH, age_seconds=age, threshold_seconds=threshold)
 
+    resolved: Final[RegisteredGraph] = resolve_graph(graph)
+    if _require_open_window() and window_state_for(resolved.name) is not WindowState.OPEN:
+        logger.info("skipping auto-refresh of %r: no Roam Desktop window open on it", graph)
+        return AutoRefresh(outcome=RefreshOutcome.WINDOW_CLOSED, age_seconds=age, threshold_seconds=threshold)
+
     try:
-        refresh_store(db_path, api_endpoint_for(resolve_graph(graph)), ollama_url=_ollama_url())
+        refresh_store(db_path, api_endpoint_for(resolved), ollama_url=_ollama_url())
     except Exception as exc:  # noqa: BLE001 — degrade to the snapshot, whatever the cause
         logger.warning("auto-refresh of %r failed; answering from the snapshot: %s", graph, exc)
         return AutoRefresh(
@@ -254,8 +276,10 @@ def semantic_search(graph: str, query: str, k: int = 10) -> SearchResponse:
     The index is a snapshot, but staleness is bounded: when the last capture is older
     than the staleness threshold (``ROAM_SEMANTIC_SEARCH_MAX_STALENESS``, default one
     hour) the index is refreshed before searching.  A failed refresh — most commonly
-    Roam Desktop not running — degrades gracefully to the snapshot; the response's
-    ``refresh`` field says which of these happened, so check it when currency matters.
+    Roam Desktop not running — degrades gracefully to the snapshot, as does a graph
+    Roam Desktop has no window open on when the deployment forbids opening one; the
+    response's ``refresh`` field says which of these happened, so check it when
+    currency matters.
 
     Args:
         graph: Which graph to search, by nickname — see ``list_indexes``.

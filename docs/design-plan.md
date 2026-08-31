@@ -208,6 +208,22 @@ roam-semantic-search/
   `dev.roam-semantic-search.refresh-scfh` (added later the same day) refreshes
   SCFH on the same hourly cadence, keeping the two indexes' staleness bounds in
   parity.
+- **Phase 4c — don't wake a closed graph: DONE 2026-08-31.** Both agents now
+  pass `--require-open-window`. The Local API is addressed per graph
+  (`/api/<name>`), so a request naming a graph Roam Desktop has no window open
+  on makes Roam *open* one — for SCFH, an encrypted graph, an unlock prompt
+  awaiting a human. SCFH had been closed since 2026-08-29, so the hourly agent
+  had raised 88 consecutive prompts, each run then failing with a Local API 500
+  and hanging for tens of seconds. `graph_windows.py` reads Roam's own record of
+  its open windows (`user-config.edn`, an EDN file listing each window's
+  `#/app/<graph>` URL) straight off disk, so the check cannot itself provoke the
+  prompt it is avoiding; the run skips with exit 0 and the next interval
+  retries. `WindowState.UNKNOWN` is kept distinct from `CLOSED`, but both skip:
+  the flag's promise is that a gated run never provokes a prompt, so only a
+  confirmed-open window satisfies it. The same gate is available to the MCP
+  server's automatic pre-search refresh via
+  `ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW` (outcome `window-closed`); the
+  explicit `refresh_index` tool is deliberately never gated.
 - **Phase 4 (optional, demand-driven):** result reranking.
 
 ## Phase 0 results (2026-08-04, live SCFH)

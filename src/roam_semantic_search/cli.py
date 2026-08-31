@@ -13,6 +13,11 @@ name.  A nickname resolves through Roam's own config files
 (:mod:`roam_semantic_search.graph_registry`) to the canonical name, the shared Local API
 port, and that graph's bearer token, so ``--port`` and ``--token`` are needed only to
 override them or to reach a graph the registry does not know.
+
+Reaching a graph opens it: a Local API request naming a graph Roam Desktop has no window
+open on makes Roam open one, which for an encrypted graph is an unlock prompt.  An
+unattended ``refresh`` should therefore pass ``--require-open-window``, which skips the
+run — successfully, so a scheduler sees no failure — unless the graph is already open.
 """
 
 import logging
@@ -30,6 +35,7 @@ from numpy.typing import NDArray
 from roam_semantic_search.embed import DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, embed_texts
 from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.graph_registry import RegisteredGraph, local_api_port, registered_graphs, resolve_graph
+from roam_semantic_search.graph_windows import WindowState, window_state_for
 from roam_semantic_search.normalize import IndexRecord, normalized_records
 from roam_semantic_search.query import SearchHit, search_store
 from roam_semantic_search.refresh import RefreshSummary, refresh_store
@@ -51,6 +57,14 @@ DbOption = Annotated[
     Path | None, typer.Option("--db", help="Index database file; defaults to ~/.cache/roam-semantic-search/<graph>.db")
 ]
 OllamaUrlOption = Annotated[str, typer.Option("--ollama-url", envvar="ROAM_SEMANTIC_SEARCH_OLLAMA_URL")]
+RequireOpenWindowOption = Annotated[
+    bool,
+    typer.Option(
+        "--require-open-window/--no-require-open-window",
+        envvar="ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW",
+        help="Skip the run unless Roam Desktop already has a window open on the graph",
+    ),
+]
 
 _TEXT_PREVIEW_MAX_CHARS: Final[int] = 200
 
@@ -166,6 +180,29 @@ def build(
     typer.echo(f"built {resolved_db} ({len(records)} records, dim {meta.dimension}) in {elapsed:.1f}s")
 
 
+def _open_window_refused(selector: str) -> bool:
+    """Whether an open-window requirement forbids touching *selector* right now.
+
+    Reports the reason it does, so a skipped scheduled run is legible in the log rather
+    than merely silent.
+
+    Args:
+        selector: The graph a command was asked to operate on.
+
+    Returns:
+        ``True`` when the graph is not confirmed open and the run must be skipped.
+    """
+    graph_name: Final[str] = _canonical_graph_name(selector)
+    state: Final[WindowState] = window_state_for(graph_name)
+    if state is WindowState.OPEN:
+        return False
+    if state is WindowState.CLOSED:
+        typer.echo(f"skipped: Roam Desktop has no window open on {graph_name}")
+        return True
+    typer.echo(f"skipped: cannot tell whether Roam Desktop has a window open on {graph_name}", err=True)
+    return True
+
+
 @app.command()
 def refresh(
     graph: GraphOption,
@@ -174,12 +211,21 @@ def refresh(
     db_path: DbOption = None,
     ollama_url: OllamaUrlOption = DEFAULT_OLLAMA_URL,
     include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
+    require_open_window: RequireOpenWindowOption = False,
 ) -> None:
-    """Incrementally update the store: re-embed only changed records, delete vanished ones."""
+    """Incrementally update the store: re-embed only changed records, delete vanished ones.
+
+    Fetching reaches the graph through the Roam Local API, and a request naming a graph that
+    Roam Desktop has no window open on makes it open one — an unlock prompt, for an encrypted
+    graph.  ``--require-open-window`` suppresses that: the run is skipped, successfully, unless
+    the graph is already open.  It is what an unattended, scheduled refresh wants.
+    """
     resolved_db: Final[Path] = _store_path(graph, db_path)
     if not resolved_db.exists():
         typer.echo(f"no index at {resolved_db} — run `roam-semantic-search build` first", err=True)
         raise typer.Exit(code=1)
+    if require_open_window and _open_window_refused(graph):
+        return
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
     started: Final[float] = time.perf_counter()
     summary: Final[RefreshSummary] = refresh_store(

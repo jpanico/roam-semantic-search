@@ -108,6 +108,7 @@ variables tune everything else, and are all optional:
 |---|---|
 | `ROAM_SEMANTIC_SEARCH_OLLAMA_URL` | Embedding server URL (default `http://127.0.0.1:11434`; must be loopback) |
 | `ROAM_SEMANTIC_SEARCH_MAX_STALENESS` | MCP `semantic_search` auto-refresh threshold, seconds (default 3600; negative disables) |
+| `ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW` | Truthy: never reach a graph Roam Desktop has no window open on (backs `--require-open-window`) |
 | `GUFFIN_ROAM_LOCAL_API_PORT` | Overrides the port from `~/.roam-local-api.json` (backs `--port`/`-p`) |
 | `GUFFIN_ROAM_API_TOKEN` | Overrides the graph's registry token (backs `--token`/`-t`) |
 | `GUFFIN_ROAM_GRAPH_NAME` | Default value for `--graph`; a nickname or canonical name |
@@ -129,6 +130,31 @@ roam-semantic-search stats --graph scfh           # store provenance: model, cou
 
 `--port` and `--token` are needed only to override the registry, or to reach a graph it
 does not know about.
+
+### Unattended refreshes: `--require-open-window`
+
+Reaching a graph opens it. The Local API is addressed per graph (`/api/<name>`), and a
+request naming a graph that Roam Desktop has no window open on makes Roam open one — for
+an encrypted graph, an unlock prompt that sits there waiting for a human. An hourly
+scheduled refresh of a graph you keep closed therefore produces an hourly unlock prompt,
+and the request fails anyway.
+
+`--require-open-window` gates the run on Roam's own record of its open windows
+(`user-config.edn`, read from disk — the check itself never touches Roam), and skips
+unless the graph is confirmed open:
+
+```bash
+roam-semantic-search refresh --graph scfh --require-open-window
+# skipped: Roam Desktop has no window open on SCFH
+```
+
+A skip **succeeds** (exit 0), so a scheduler records no failure and the next run simply
+retries. Only a confirmed-open window satisfies the requirement: an unreadable window
+state skips too, since the flag's promise is that the run never provokes a prompt.
+
+The flag is opt-in — an unflagged `refresh` behaves exactly as it always has — because
+an interactive refresh of a closed graph is a reasonable thing to ask for, and unlocking
+the graph is then a deliberate answer rather than an ambush.
 
 A hit shows the Roam uid (usable as a `((ref))`), the fused score, each ranking's
 position (`v:` vector, `k:` keyword), the breadcrumb, and the text:
@@ -156,8 +182,15 @@ snapshot — but when the last capture is older than the staleness threshold
 (`ROAM_SEMANTIC_SEARCH_MAX_STALENESS`, default one hour) it refreshes the index before
 searching. A failed refresh (most commonly Roam Desktop not running) degrades gracefully
 to the snapshot. Either way the response's `refresh` field reports what happened —
-`fresh`, `refreshed`, `refresh-failed` (with the error), or `disabled` — so a caller who
-cares about currency checks one field instead of doing timestamp arithmetic.
+`fresh`, `refreshed`, `refresh-failed` (with the error), `window-closed`, or `disabled`
+— so a caller who cares about currency checks one field instead of doing timestamp
+arithmetic.
+
+Set `ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW=1` and the *automatic* pre-search refresh
+is gated the same way `--require-open-window` gates the CLI, reporting `window-closed`
+and answering from the snapshot. Searching a closed encrypted graph then costs no unlock
+prompt. An explicit `refresh_index` call is never gated — asking for it is deliberate,
+and it is the way to say *yes, open the graph, I will unlock it*.
 
 Register with Claude Code — no per-graph configuration, since the server reads Roam's
 registry directly:
