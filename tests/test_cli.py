@@ -50,7 +50,7 @@ def stub_window_state(monkeypatch: pytest.MonkeyPatch, state: WindowState) -> No
 
 
 class TestRefreshOpenWindowGate:
-    """refresh --require-open-window: never provoke Roam into opening a graph."""
+    """refresh --require-open-window: skip the graphs Roam certainly cannot serve."""
 
     def test_closed_window_skips_without_touching_the_api(
         self, store: Path, reached: list[Path], monkeypatch: pytest.MonkeyPatch
@@ -65,7 +65,7 @@ class TestRefreshOpenWindowGate:
     def test_unknown_window_state_also_skips(
         self, store: Path, reached: list[Path], monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Only a confirmed-open window satisfies the requirement."""
+        """An unreadable list is not a listing, so it cannot satisfy the requirement."""
         stub_window_state(monkeypatch, WindowState.UNKNOWN)
         result = runner.invoke(cli.app, ["refresh", "--graph", "SCFH", "--db", str(store), "--require-open-window"])
         assert result.exit_code == 0

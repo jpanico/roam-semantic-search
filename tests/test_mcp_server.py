@@ -124,14 +124,14 @@ class TestEnsuredFreshWindowGate:
     """_ensured_fresh: whether a stale index is refreshed when its graph has no open window."""
 
     def test_closed_window_skips_the_refresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The whole point: an automatic refresh never provokes an unlock prompt."""
+        """The whole point: an automatic refresh skips a graph Roam cannot serve."""
         reached: Final[list[str]] = stub_auto_refresh(monkeypatch, WindowState.CLOSED, required=True)
         outcome: Final[AutoRefresh] = mcp_server._ensured_fresh("SCFH", Path("ignored.db"))
         assert outcome.outcome is RefreshOutcome.WINDOW_CLOSED
         assert reached == []
 
     def test_unknown_window_state_also_skips(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Only a confirmed-open window satisfies the requirement."""
+        """An unreadable list is not a listing, so it cannot satisfy the requirement."""
         reached: Final[list[str]] = stub_auto_refresh(monkeypatch, WindowState.UNKNOWN, required=True)
         outcome: Final[AutoRefresh] = mcp_server._ensured_fresh("SCFH", Path("ignored.db"))
         assert outcome.outcome is RefreshOutcome.WINDOW_CLOSED

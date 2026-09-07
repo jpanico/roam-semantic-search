@@ -139,9 +139,9 @@ an encrypted graph, an unlock prompt that sits there waiting for a human. An hou
 scheduled refresh of a graph you keep closed therefore produces an hourly unlock prompt,
 and the request fails anyway.
 
-`--require-open-window` gates the run on Roam's own record of its open windows
-(`user-config.edn`, read from disk — the check itself never touches Roam), and skips
-unless the graph is confirmed open:
+`--require-open-window` gates the run on Roam's window-restore list (`user-config.edn`,
+read from disk — the check itself never touches Roam), and skips unless that list names
+the graph:
 
 ```bash
 roam-semantic-search refresh --graph scfh --require-open-window
@@ -149,8 +149,22 @@ roam-semantic-search refresh --graph scfh --require-open-window
 ```
 
 A skip **succeeds** (exit 0), so a scheduler records no failure and the next run simply
-retries. Only a confirmed-open window satisfies the requirement: an unreadable window
-state skips too, since the flag's promise is that the run never provokes a prompt.
+retries. An unreadable list skips too — it is not a listing.
+
+**What the flag can and cannot do.** The check is a *necessary* condition for
+reachability, not a sufficient one, so it reduces prompts rather than abolishing them:
+
+- An **unlisted** graph is certainly unservable, and skipping it is always right.
+- A **listed** graph may still be closed or, for an encrypted graph, locked. The file is
+  a restore list — written when the window set changes, then carried across a relaunch —
+  and it records only that a window exists, never whether the graph behind it is
+  unlocked. A relaunch re-locks an encrypted graph while faithfully restoring its window,
+  so a stale listing sails through the gate and the request prompts anyway.
+
+Nothing observable off the filesystem distinguishes a servable graph from a locked one:
+the Local API has no graph-agnostic status route, so the request itself is the only test,
+and issuing it is what raises the prompt. **A scheduled refresh of a graph you keep
+locked will therefore prompt sooner or later — the durable fix is not to schedule one.**
 
 The flag is opt-in — an unflagged `refresh` behaves exactly as it always has — because
 an interactive refresh of a closed graph is a reasonable thing to ask for, and unlocking

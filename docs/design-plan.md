@@ -224,6 +224,27 @@ roam-semantic-search/
   server's automatic pre-search refresh via
   `ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW` (outcome `window-closed`); the
   explicit `refresh_index` tool is deliberately never gated.
+- **Phase 4d — the open-window gate was not sufficient; SCFH's agent retired:
+  DONE 2026-09-07.** Phase 4c rested on a premise that is false: that a graph named in
+  `:roam/windows` can be served. It cannot be relied on for two independent reasons. The
+  file is a *restore* list — Roam writes it when the window set changes and then carries
+  it across a relaunch — so a listing outlives the session that created it; and it records
+  only that a **window** exists, never whether the encrypted graph behind one is
+  **unlocked**, which is the fact that actually decides whether the Local API can serve it
+  (a relaunch re-locks the graph while faithfully restoring its window). Observed: the gate
+  skipped 27 runs correctly, then SCFH was opened on 2026-09-05 21:02 and entered the list;
+  Roam relaunched 2026-09-06 08:34 without rewriting the file; from then on every hourly
+  run read `SCFH -> open`, issued the request, and raised the unlock prompt the gate
+  existed to prevent — 93 failures. Since no filesystem-observable fact distinguishes a
+  servable graph from a locked one, and the request itself is the only test, **a scheduled
+  refresh of a habitually-locked graph cannot be made prompt-free**. The
+  `dev.roam-semantic-search.refresh-scfh` agent was therefore unloaded and its plist
+  deleted (reconstructible from its `refresh-brain` sibling: same plist, `--graph scfh`,
+  own log path); SCFH's index is now refreshed on demand — the MCP server's pre-search
+  auto-refresh when a search finds it stale, or an explicit `refresh` / `refresh_index`.
+  The gate itself is kept and its documentation corrected to claim only what it proves: an
+  unlisted graph is certainly unservable (skipping is always right), a listed one merely
+  might be servable. `brain`/hippo keeps its hourly agent, the graph being habitually open.
 - **Phase 4 (optional, demand-driven):** result reranking.
 
 ## Phase 0 results (2026-08-04, live SCFH)

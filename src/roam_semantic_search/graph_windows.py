@@ -1,6 +1,6 @@
-"""Which graphs Roam Desktop currently has a window open on.
+"""Which graphs Roam Desktop's window-restore list names.
 
-Roam Desktop records its open windows in an EDN file of its own, so that a relaunch can
+Roam Desktop records its windows in an EDN file of its own, so that a relaunch can
 restore them:
 
 .. code-block:: clojure
@@ -10,11 +10,23 @@ restore them:
      :roam/local-api-enabled? true}
 
 Each window names its graph in the ``#/app/<graph>`` fragment of its URL.  Reading that
-file is the only way to learn which graphs are open **without touching the graphs**: the
-Local API is addressed per graph (``/api/<name>``), it offers no graph-agnostic status
-route, and a request naming a closed graph is itself what makes Roam Desktop open a window
-for it — which, for an encrypted graph, is an unlock prompt awaiting a human.  A caller
-that must not provoke that prompt therefore has to ask the filesystem, not the API.
+file is the only way to learn anything about Roam's windows **without touching the
+graphs**: the Local API is addressed per graph (``/api/<name>``), it offers no
+graph-agnostic status route, and a request naming a graph Roam cannot serve is itself
+what makes Roam Desktop open a window for it — which, for an encrypted graph, is an
+unlock prompt awaiting a human.  A caller that must not provoke that prompt therefore
+has to ask the filesystem, not the API.
+
+**What a listing does and does not prove.**  This is a *restore* list, not a live
+register of what is loaded: Roam writes it when the window set changes and then carries
+it across a relaunch, so a graph can remain listed long after it was last usable.  Worse,
+the list records only that a window exists — never whether an encrypted graph behind one
+is **unlocked**, which is the fact that decides whether the Local API can serve it, and a
+relaunch re-locks such a graph while faithfully restoring its window.  So a listing is a
+*necessary* condition for reachability and nowhere near a sufficient one: an unlisted
+graph is certainly unreachable, while a listed one may be closed, locked, or fine.  No
+caller may read :data:`WindowState.OPEN` as a promise that a request will be served
+without a prompt — nothing observable off the filesystem carries that promise.
 
 The state is a snapshot of a file Roam owns and writes on its own schedule, so a reading
 is evidence rather than proof; :class:`WindowState` keeps :data:`WindowState.UNKNOWN`
@@ -26,8 +38,8 @@ Public symbols:
 - :data:`WINDOW_STATE_PATH` — where Roam records its open windows on this platform.
 - :data:`GRAPH_URL_PATTERN` / :data:`GRAPH_URL_RE` — the ``#/app/<graph>`` fragment.
 - :data:`WINDOWS_VECTOR_PATTERN` / :data:`WINDOWS_VECTOR_RE` — the ``:roam/windows`` vector.
-- :class:`WindowState` — whether a graph has a window open, has none, or cannot be told.
-- :func:`open_graph_names` — the graphs with a window open, or ``None`` when unreadable.
+- :class:`WindowState` — whether a graph is listed, is absent, or cannot be told.
+- :func:`open_graph_names` — the listed graphs, or ``None`` when unreadable.
 - :func:`window_state_for` — one graph's window state.
 """
 
@@ -85,7 +97,12 @@ GRAPH_URL_RE: Final[regex.Pattern[str]] = regex.compile(GRAPH_URL_PATTERN)
 
 
 class WindowState(enum.StrEnum):
-    """Whether a graph has a Roam Desktop window open.
+    """Whether Roam Desktop's window-restore list names a graph.
+
+    ``OPEN`` means only that: the graph is listed.  It does not mean the graph is loaded,
+    or — for an encrypted graph — unlocked, and so it never promises that a Local API
+    request will be served without raising an unlock prompt.  ``CLOSED``, by contrast, is
+    conclusive in its own direction: an unlisted graph cannot be served.
 
     ``UNKNOWN`` is deliberately distinct from ``CLOSED``: a missing or unparseable
     window-state file says nothing about the graph, and a caller gating a side effect on
@@ -99,12 +116,12 @@ class WindowState(enum.StrEnum):
 
 @validate_call
 def open_graph_names() -> tuple[str, ...] | None:
-    """The graphs Roam Desktop currently has a window open on.
+    """The graphs named in Roam Desktop's window-restore list.
 
     Returns:
-        One entry per open window, in the order the file lists them, percent-decoded and
-        with duplicates preserved (a graph may be open in more than one window); an empty
-        tuple when Roam records no open window, and ``None`` when the state cannot be
+        One entry per listed window, in the order the file lists them, percent-decoded
+        and with duplicates preserved (a graph may be listed for more than one window);
+        an empty tuple when Roam lists no window, and ``None`` when the state cannot be
         read at all — an absent, unreadable, or unrecognizable file.
     """
     if not WINDOW_STATE_PATH.is_file():
@@ -124,15 +141,16 @@ def open_graph_names() -> tuple[str, ...] | None:
 
 @validate_call
 def window_state_for(graph_name: str) -> WindowState:
-    """Whether *graph_name* has a Roam Desktop window open.
+    """Whether Roam Desktop's window-restore list names *graph_name*.
 
     Args:
         graph_name: A graph's canonical Roam name, matched case-insensitively — the same
             spelling that addresses it in a Local API path.
 
     Returns:
-        ``OPEN`` when a window names the graph, ``CLOSED`` when the window state is
-        legible and names no such window, and ``UNKNOWN`` when it cannot be read.
+        ``OPEN`` when a listed window names the graph — which does not establish that
+        the graph can be served — ``CLOSED`` when the list is legible and names no such
+        window, and ``UNKNOWN`` when it cannot be read.
     """
     names: Final[tuple[str, ...] | None] = open_graph_names()
     if names is None:

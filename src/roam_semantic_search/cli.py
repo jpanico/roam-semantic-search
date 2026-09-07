@@ -14,10 +14,13 @@ name.  A nickname resolves through Roam's own config files
 port, and that graph's bearer token, so ``--port`` and ``--token`` are needed only to
 override them or to reach a graph the registry does not know.
 
-Reaching a graph opens it: a Local API request naming a graph Roam Desktop has no window
-open on makes Roam open one, which for an encrypted graph is an unlock prompt.  An
+Reaching a graph opens it: a Local API request naming a graph Roam Desktop cannot serve
+makes Roam open a window for it, which for an encrypted graph is an unlock prompt.  An
 unattended ``refresh`` should therefore pass ``--require-open-window``, which skips the
-run — successfully, so a scheduler sees no failure — unless the graph is already open.
+run — successfully, so a scheduler sees no failure — unless Roam's window-restore list
+names the graph.  That test only rules out the graphs Roam certainly cannot serve; being
+listed is no guarantee of being served, so the flag reduces prompts without abolishing
+them (see :mod:`roam_semantic_search.graph_windows`).
 """
 
 import logging
@@ -62,7 +65,7 @@ RequireOpenWindowOption = Annotated[
     typer.Option(
         "--require-open-window/--no-require-open-window",
         envvar="ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW",
-        help="Skip the run unless Roam Desktop already has a window open on the graph",
+        help="Skip the run unless Roam Desktop's window-restore list names the graph",
     ),
 ]
 
@@ -190,7 +193,9 @@ def _open_window_refused(selector: str) -> bool:
         selector: The graph a command was asked to operate on.
 
     Returns:
-        ``True`` when the graph is not confirmed open and the run must be skipped.
+        ``True`` when Roam's window-restore list does not name the graph — or cannot be
+        read — and the run must therefore be skipped.  A ``False`` here clears the run
+        to proceed; it does not predict that the request will be served.
     """
     graph_name: Final[str] = _canonical_graph_name(selector)
     state: Final[WindowState] = window_state_for(graph_name)
@@ -215,10 +220,11 @@ def refresh(
 ) -> None:
     """Incrementally update the store: re-embed only changed records, delete vanished ones.
 
-    Fetching reaches the graph through the Roam Local API, and a request naming a graph that
-    Roam Desktop has no window open on makes it open one — an unlock prompt, for an encrypted
-    graph.  ``--require-open-window`` suppresses that: the run is skipped, successfully, unless
-    the graph is already open.  It is what an unattended, scheduled refresh wants.
+    Fetching reaches the graph through the Roam Local API, and a request naming a graph Roam
+    Desktop cannot serve makes it open a window — an unlock prompt, for an encrypted graph.
+    ``--require-open-window`` skips the run, successfully, unless Roam's window-restore list
+    names the graph.  That rules out the certainly-unservable graphs, not every prompt: a
+    listed graph may still be closed or locked, and only the request itself finds out.
     """
     resolved_db: Final[Path] = _store_path(graph, db_path)
     if not resolved_db.exists():
