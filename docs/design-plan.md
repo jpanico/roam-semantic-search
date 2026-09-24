@@ -245,6 +245,22 @@ roam-semantic-search/
   The gate itself is kept and its documentation corrected to claim only what it proves: an
   unlisted graph is certainly unservable (skipping is always right), a listed one merely
   might be servable. `brain`/hippo keeps its hourly agent, the graph being habitually open.
+- **Scheduled refresh retired for brain too: 2026-09-24.** The same failure reached hippo:
+  Roam relaunched 2026-09-24 05:18 with hippo's window in the restore list, and every hourly
+  run from then on read `hippo -> open`, issued the request, and had Roam raise the hippo
+  window (HTTP 500 "Promise error", six failures) — the periodic pop-up Joe noticed. Rule
+  set by Joe the same day: **hippo's index is refreshed only when hippo is already open in a
+  Roam window, and a refresh must never make Roam open one**; stale `brain` results are
+  expected whenever hippo isn't open. Since the restore-list gate cannot tell a loaded,
+  unlocked graph from a restored-but-locked window, and no permission-free live signal
+  exists (`osascript` window titles need Accessibility), the only unattended caller was
+  removed: `dev.roam-semantic-search.refresh-brain` unloaded via `launchctl bootout`, its
+  plist moved to `~/.local/share/roam-semantic-search/refresh-brain.plist.disabled-20260924`
+  for reference. Both graphs now refresh on demand only — the MCP server's pre-search
+  auto-refresh (still gated by `ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW=1` in
+  `~/.claude.json`, so an unlisted graph is never touched) or an explicit `refresh` /
+  `refresh_index` — which happen only while the user is present to see why a listed window
+  came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
 
 ## Phase 0 results (2026-08-04, live SCFH)
