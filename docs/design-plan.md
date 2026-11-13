@@ -262,6 +262,9 @@ roam-semantic-search/
   `refresh_index` — which happen only while the user is present to see why a listed window
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
+- **Phase 5 — PDF attachment text: PLANNED 2026-11-13.** Index the text inside attached
+  PDFs — about 1,400 in hippo, most of them encrypted. Measurements, design, and the
+  5a–5e sub-phases are in *PDF attachments* below.
 
 ## Phase 0 results (2026-08-04, live SCFH)
 
@@ -290,6 +293,102 @@ Findings beyond the raw numbers:
   graph-token records) — skip-list material regardless.
 - **~2 M chars ≈ a few thousand embed calls** (block-level chunks): a full
   index build is minutes of local Ollama work, not hours.
+
+## PDF attachments (Phase 5 plan, 2026-11-13)
+
+The index holds no PDF content today. A PDF sits in a block as `{{[[pdf]]: <url>}}` (or
+the older bare `{{pdf: <url>}}`); the full-graph pull carries only that markup, never the
+file, and normalize's widget pass strips it. A block holding nothing but a PDF therefore
+yields no record, and a PDF is findable only through the text around it — its block's
+own words, its children, its ancestors, its page title and tags.
+
+### Measured (2026-11-13, live hippo)
+
+Datalog over `:block/string` with `clojure.string/includes?`, parsed with guffin's
+`PDF_EMBED_RE`:
+
+| Measurement | Result |
+|---|---|
+| Blocks embedding `{{[[pdf]]: …}}` | 1,388 — 1,382 distinct URLs among the 1,385 guffin parses |
+| Blocks embedding `{{pdf: …}}` | 22 — unencrypted, under the graph's older `joesbrain` storage path |
+| Encrypted (`.pdf.enc`) | 1,285 of those 1,382 URLs |
+| On daily-note pages | 988 of 1,385 |
+| Daily-note PDFs by year | 2022: 130 · 2023: 196 · 2024: 149 · 2025: 186 · 2026 (to Nov 13): 270 |
+| Heaviest standing pages | Portugal 2026 (37), 2024 tax (30), Thailand 2025 (27), 2025 tax (24) |
+| Missed by `PDF_EMBED_RE` | 3 (`JAhyOK80q`, `BT-cJ9znD`, `xY5Q9jDbo`): upload names carrying `'`, `(`, `)` or `!`, which the `object_path` class `[\w%.-]+` of guffin's `FIREBASE_STORAGE_URL_PATTERN` rejects |
+
+Not measured: SCFH (not open in Roam that day; the query would have made Roam open it),
+and for every graph the file sizes, page counts, text-layer yield, and password
+protection — Phase 5a's job.
+
+### Design
+
+- **Fetch.** guffin's `LocalApiGraphSource.fetch_file` — the Local API `file.get`
+  action, which returns an encrypted graph's assets decrypted. Never with a `cache_dir`:
+  no decrypted PDF bytes are written to disk. A file fetch is a Local API request like
+  the graph pull, so it runs only inside a build or refresh that already reached the
+  graph, under the same open-window gate.
+- **Text cache.** Extraction results keyed by the SHA-256 of the URL. A Firebase Storage
+  URL names one immutable upload, so an entry never goes stale. It lives in its own
+  SQLite file, `~/.cache/roam-semantic-search/<graph>.pdf-text.db`, because
+  `write_store` deletes and recreates the store on every `build`, and a rebuild must not
+  refetch ~1,400 files. Per entry: status (`ok` / `no-text` / `password` /
+  `fetch-failed` / `parse-failed`), per-page text, page count, upload name
+  (`recovered_upload_name`), extractor version, extracted-at. Bumping the extractor
+  version re-extracts.
+- **Extract.** pypdfium2 (Apache-2.0 / BSD-3), text layer only in the first cut.
+  PyMuPDF is ruled out: AGPL, against this repo's MIT.
+- **Records.** One record per chunk: a PDF page, split past ~2,000 chars with a small
+  overlap. Embed input: `breadcrumb › block text › PDF "<upload name>" p. N | <chunk>`.
+  Chunk text does **not** fold into ancestors' `descendant_text` — it would swamp every
+  ancestor and page record and overrun `EMBED_INPUT_MAX_CHARS`.
+- **Schema v3.** `records` gains a `record_id` primary key: the Roam uid for page and
+  block records, `<uid>/pdf/<urlhash8>/<page>.<chunk>` for chunks. `uid` stays the host
+  block's Roam uid (Constraint 3: every hit one `((uid))` away), joined by `kind` and
+  `pdf_page` columns; the FTS mirror keys by `record_id`. The refresh diff keys by
+  `record_id` and is otherwise unchanged — content-hash selection covers chunks as-is.
+  The existing schema-version guard forces the full rebuild.
+- **Module placement.** `normalize.py` stays pure. A new `pdf_text.py` finds PDF embeds
+  in the pulled rows, consults the cache, and fetches and extracts the misses; a pure
+  `pdf_chunk_records(rows, texts)` turns cached texts into `IndexRecord`s. `build` and
+  `refresh` call both.
+- **Query.** Collapse to the best chunk per (host uid, PDF) before taking the top *k*,
+  so one long PDF cannot fill the results. `SearchHit` and the MCP response gain
+  `kind`, `pdf_name`, `pdf_page`.
+- **Refresh budget.** The pre-search auto-refresh must stay quick: it fetches at most N
+  new PDFs or T seconds' worth, and `RefreshSummary` and the MCP `refresh` field report
+  `pdf_pending`. A new `extract-pdfs --graph` command (and `build`) works the backlog.
+- **Failure posture.** A bad PDF never fails a refresh: its status is cached, and it is
+  not retried until the extractor version moves or `--retry-failed` is passed.
+- **Privacy.** Fully local, like everything else. The new exposure is the text cache:
+  decrypted text of tax, medical, and estate documents at rest. It is the same class as
+  the store, which already holds decrypted block text — and both stores are `0644`
+  today. Create the text cache `0600`, and tighten the stores to match.
+- **Daily notes.** PDF chunks follow `--no-daily-notes` like their host blocks.
+
+### Sub-phases
+
+- **5a — measure (spike).** Fetch every hippo PDF into memory only; record bytes, fetch
+  time, pages, text-layer yield, and the password-protected count. Decides whether OCR
+  belongs in the first cut and what a first build costs. Count SCFH's PDFs the next time
+  it is open.
+- **5b — extraction.** Fix `FIREBASE_STORAGE_URL_PATTERN` upstream in guffin (the three
+  misses above; guffin's own asset handling shares the pattern). Text cache, pypdfium2
+  extraction, `extract-pdfs`; tests over fixture PDFs.
+- **5c — records and search.** Chunk records, schema v3, best-chunk collapse, the new
+  hit fields in MCP and CLI; rebuild hippo.
+- **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting.
+- **5e — OCR, only if 5a finds many scans.** macOS Vision, on-device, for `no-text`
+  pages; an extractor-version bump re-extracts just those entries.
+
+### Risks
+
+- **Search-time matrix load.** Every search loads the whole embedding matrix — hippo's
+  is ~44 MB at 14,162 records today; another ~10k chunks would take it to ~75 MB. If
+  that shows in search latency, keep the matrix resident in the MCP server between
+  searches.
+- **Fetch time** is the unmeasured cost, which 5a exists to measure. Embedding is not:
+  Phase 1's ~78 records/s puts 10k chunks at about two minutes.
 
 ## Open questions
 
