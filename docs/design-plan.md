@@ -262,9 +262,10 @@ roam-semantic-search/
   `refresh_index` — which happen only while the user is present to see why a listed window
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
-- **Phase 5 — PDF attachment text: PLANNED 2026-11-13.** Index the text inside attached
-  PDFs — about 1,400 in hippo, most of them encrypted. Measurements, design, and the
-  5a–5e sub-phases are in *PDF attachments* below.
+- **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement) DONE
+  2026-11-13.** Index the text inside attached PDFs — about 1,400 in hippo, most of them
+  encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's results are in
+  *PDF attachments* below.
 
 ## Phase 0 results (2026-08-04, live SCFH)
 
@@ -368,27 +369,69 @@ protection — Phase 5a's job.
 
 ### Sub-phases
 
-- **5a — measure (spike).** Fetch every hippo PDF into memory only; record bytes, fetch
-  time, pages, text-layer yield, and the password-protected count. Decides whether OCR
-  belongs in the first cut and what a first build costs. Count SCFH's PDFs the next time
-  it is open.
+- **5a — measure (spike): DONE 2026-11-13 for hippo** (results below). Fetch every PDF
+  into memory only; record bytes, fetch time, pages, text-layer yield, and the
+  password-protected count. Decides whether OCR belongs in the first cut and what a first
+  build costs. SCFH is still to be measured, the next time it is open.
 - **5b — extraction.** Fix `FIREBASE_STORAGE_URL_PATTERN` upstream in guffin (the three
   misses above; guffin's own asset handling shares the pattern). Text cache, pypdfium2
   extraction, `extract-pdfs`; tests over fixture PDFs.
 - **5c — records and search.** Chunk records, schema v3, best-chunk collapse, the new
   hit fields in MCP and CLI; rebuild hippo.
 - **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting.
-- **5e — OCR, only if 5a finds many scans.** macOS Vision, on-device, for `no-text`
-  pages; an extractor-version bump re-extracts just those entries.
+- **5e — OCR, following 5c.** macOS Vision, on-device, for pages without a text layer;
+  an extractor-version bump re-extracts just those entries. 5a settled the "only if":
+  157 PDFs are fully scanned and unfindable without it.
+
+### Phase 5a results (2026-11-13, live hippo)
+
+Spike script: `spike/phase5a_pdf_measure.py` (project venv; resumable; refuses to run
+unless the window-restore list names the graph). The full-graph pull found 1,411 blocks
+embedding a PDF, 1,408 distinct URLs.
+
+| Measurement | Result |
+|---|---|
+| PDFs | 1,408 — 1,288 encrypted, 1,002 on daily-note pages |
+| Outcome | 1,233 with text · 157 no text layer · 17 password-protected · 1 fetch failed |
+| Pages | 9,068; **7,928 (87%) with a text layer**; median 2 per PDF, p90 11, max 338 |
+| Decrypted size | 1.51 GB; median 0.19 MB, p90 1.94 MB, max 117.9 MB |
+| `file.get` fetch | **1,026 s total (~17 min)**; median 0.55 s, p90 0.99 s, max 27.1 s; ~1.5 MB/s |
+| pypdfium2 extraction | 26.6 s total; median 0.01 s |
+| Text-layer chars | 11.34 M |
+| Projected chunk records | **10,433** (2,000-char chunks, 200-char overlap) |
+
+Findings beyond the raw numbers:
+
+- **OCR is not a prerequisite, but not optional for coverage.** 1,140 pages carry no
+  text layer: 957 across the 157 fully scanned PDFs (101 of them on daily notes), 183 in
+  89 partly scanned ones. A text-layer-only first cut covers 87% of pages and leaves
+  11% of PDFs unfindable, so 5e follows 5c rather than waiting on demand.
+- **Chunks concentrate in a few large PDFs.** The 10 largest yield 25% of all chunks,
+  the top 50 yield 52%; the longest (338 pages) alone yields 542. The best-chunk-per-PDF
+  collapse is required, not a refinement.
+- **Index growth is as predicted:** hippo goes from 14,162 to ~24,600 records, and the
+  search-time matrix from ~44 MB to ~75 MB.
+- **The refresh budget matters only for the first build.** Daily-note PDFs arrive at
+  under one a day in 2026, at ~0.5 s each; the ~17-minute backlog is a one-off for
+  `build` / `extract-pdfs`.
+- **guffin's pattern is the only obstacle for the three odd upload names.** `file.get`
+  served all three (`ok`), and pydantic's `HttpUrl` left every one of the 1,408 URLs
+  unchanged.
+- **The one fetch failure** (`Ahg2ca1kK`) is a Local API 500, "Unable to get file
+  metadata" — most likely an upload that no longer exists; `fetch-failed` covers it.
+- **Password protection is terminal.** All 17 report PDFium's "Incorrect password";
+  `password` is a final status, not a retry candidate.
 
 ### Risks
 
 - **Search-time matrix load.** Every search loads the whole embedding matrix — hippo's
-  is ~44 MB at 14,162 records today; another ~10k chunks would take it to ~75 MB. If
+  is ~44 MB at 14,162 records today; 5a's 10,433 chunks would take it to ~75 MB. If
   that shows in search latency, keep the matrix resident in the MCP server between
   searches.
-- **Fetch time** is the unmeasured cost, which 5a exists to measure. Embedding is not:
-  Phase 1's ~78 records/s puts 10k chunks at about two minutes.
+- **Embedding time** is now the largest unmeasured cost (5a measured fetching). Chunks
+  average ~1,100 chars, far longer than a block, so records/s understates it; scaling
+  SCFH's Phase 1 build (~1.9 M chars in ~100 s) puts 11.3 M chars on the order of ten
+  minutes.
 
 ## Open questions
 
