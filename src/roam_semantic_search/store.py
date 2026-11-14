@@ -22,6 +22,7 @@ Public symbols:
 - :func:`stamp_refresh` — record a refresh moment and record count in the meta.
 - :func:`read_meta` — the store's :class:`StoreMeta`.
 - :func:`stored_hashes` — every record's content hash by record id.
+- :func:`stored_record_count` — how many records the store holds.
 - :func:`load_embedding_matrix` — every record's embedding as one float32 matrix.
 - :func:`keyword_ranked_ids` — BM25-ranked record ids for a query's terms.
 - :func:`records_by_id` — read back records by record id.
@@ -407,6 +408,23 @@ def stored_hashes(db_path: Path) -> dict[str, str]:
     finally:
         connection.close()
     return dict(rows)
+
+
+@validate_call
+def stored_record_count(db_path: Path) -> int:
+    """How many records the store holds.
+
+    Args:
+        db_path: The store's database file.
+
+    Returns:
+        The ``records`` table's row count.
+    """
+    connection: Final[sqlite3.Connection] = sqlite3.connect(db_path)
+    try:
+        return int(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+    finally:
+        connection.close()
 
 
 @validate_call

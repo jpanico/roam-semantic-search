@@ -263,7 +263,8 @@ roam-semantic-search/
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
 - **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement), 5b
-  (extraction), and 5c (records and search) DONE 2026-11-13.** Index the text inside attached PDFs — about 1,400 in
+  (extraction), and 5c (records and search) DONE 2026-11-13; 5d (budgets) DONE
+  2026-11-14.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
 
@@ -357,9 +358,10 @@ protection — Phase 5a's job.
   in the pulled rows, consults the cache, and fetches and extracts the misses; a pure
   `pdf_chunk_records(rows, texts)` turns cached texts into `IndexRecord`s. *As built:*
   `pdf_chunk_records` lives in `normalize.py` beside the breadcrumb machinery it reuses,
-  and `build` / `refresh` only *read* the cache — fetching stays the explicit
-  `extract-pdfs` command until 5d gives refresh a budget, so no search-triggered
-  auto-refresh can start a large fetch.
+  and in 5c `build` / `refresh` only *read* the cache. Since 5d they also fetch what the
+  cache lacks, within a budget (*Refresh budget*), filtered by
+  `normalize.indexable_pdf_embeds` so a `--no-daily-notes` index spends no budget on PDFs
+  it would not index.
 - **Query.** Collapse to the best chunk per (host uid, PDF) before taking the top *k*,
   so one long PDF cannot fill the results. `SearchHit` and the MCP response gain
   `kind`, `pdf_name`, `pdf_page`. Each leg's candidate pool widens to
@@ -368,6 +370,16 @@ protection — Phase 5a's job.
 - **Refresh budget.** The pre-search auto-refresh must stay quick: it fetches at most N
   new PDFs or T seconds' worth, and `RefreshSummary` and the MCP `refresh` field report
   `pdf_pending`. A new `extract-pdfs --graph` command (and `build`) works the backlog.
+  *As built (5d):* a `PdfFetchBudget` bounds PDFs, bytes, and seconds, checked before each
+  fetch; `refresh_store` takes it plus `max_pdf_embeds`, which caps PDF chunk embeddings
+  (page and block records are never deferred — an edit always lands; deferred chunks
+  stay due and a later refresh embeds them). Every refresh the MCP server runs, automatic
+  or `refresh_index`, uses the interactive budget — 10 PDFs, 50 MB, 15 s, 250 chunk
+  embeddings — and `AutoRefresh.summary` carries `pdf_pending_count` and
+  `embed_deferred_count`. The CLI's `build`, `refresh`, and `extract-pdfs` default to a
+  500 MB byte budget per run (`--max-pdfs`, `--max-pdf-mb`; `refresh` also
+  `--max-pdf-embeds`). A PDF fetch that fails mid-refresh — Roam gone, five failures in a
+  row — is reported as `pdf_error`, and the refresh goes on with the cached text.
 - **Failure posture.** A bad PDF never fails a refresh: its status is cached and decides
   when it comes back. `password` never does (an upload never changes); `fetch-failed`
   only with `--retry-failed`; `parse-failed` with `--retry-failed` or a newer extractor;
@@ -398,7 +410,7 @@ protection — Phase 5a's job.
   of 5a's ~1.5 GB through the same process an hour earlier, and the largest PDF still
   pending is 84.6 MB. Cause unconfirmed; plausibly the main process building a ~110 MB
   base64 string under accumulated memory pressure. The cache kept every completed entry,
-  as designed. After a Roam relaunch, one resumed `--limit 200` run (21:49) fetched the
+  as designed. After a Roam relaunch, one resumed `--limit 200` run (21:49; the option is `--max-pdfs` since 5d) fetched the
   remaining 162 in 121 s without incident, the 84.6 MB PDF included — so the file alone
   is not the trigger, and accumulated state in a long-lived process is the likelier one.
   The finished cache matches 5a exactly: 1,408 PDFs — 1,233 `ok`, 157 `no-text`, 17
@@ -415,10 +427,14 @@ protection — Phase 5a's job.
   chunks than 5a's character arithmetic assumed. A search, query embedding included,
   answers in ~120 ms. Spot checks found the right PDF passage for an appliance-manual
   question, a hotel booking, and tax forms, one hit per PDF alongside block hits.
-- **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting —
-  and, since 5c, a cap on chunk *embeddings* per auto-refresh: after an `extract-pdfs`
-  run adds many PDFs, the next pre-search refresh would otherwise embed every new chunk
-  before answering (hippo's ~10,400 take ~10 minutes).
+- **5d — refresh budget: DONE 2026-11-14.** The per-refresh fetch cap and `pdf_pending`
+  reporting — and, since 5c, a cap on chunk *embeddings* per auto-refresh: after an
+  `extract-pdfs` run adds many PDFs, the next pre-search refresh would otherwise embed
+  every new chunk before answering (hippo's ~10,400 take ~10 minutes). Built as described
+  under *Refresh budget*. Live on hippo: with nothing pending, a refresh under the
+  interactive budget took 3.2 s. Against scratch copies of the store and cache with 30
+  PDFs removed, one refresh fetched 10 (8.3 MB) and reported 20 pending in 15.7 s; a
+  second fetched 10 more and, under a 5-chunk embed cap, embedded 5 and deferred 19.
 - **5e — OCR, following 5c.** macOS Vision, on-device, for pages without a text layer;
   an extractor-version bump re-extracts just those entries. 5a settled the "only if":
   157 PDFs are fully scanned and unfindable without it.
@@ -468,9 +484,9 @@ Findings beyond the raw numbers:
   to Roam's Electron main process as one base64 string. The crash followed ~2.8 GB of such
   traffic through a week-old process, while a fresh process then served the largest
   pending file without trouble, so volume per process looks like the trigger rather than
-  any one file. Until the cause is known, work a backlog in batches (`--limit`), ideally
-  soon after a Roam relaunch, and make 5d's budget cap bytes per run, not only count or
-  time.
+  any one file. Until the cause is known, work a backlog in batches, ideally soon after a
+  Roam relaunch. *5d:* every fetching command now caps bytes per run — 500 MB from the
+  CLI, 50 MB from the MCP server — so batching is the default rather than advice.
 - **Search-time matrix load.** Every search loads the whole embedding matrix — hippo's
   is ~44 MB at 14,162 records today; 5a's 10,433 chunks would take it to ~75 MB. If
   that shows in search latency, keep the matrix resident in the MCP server between

@@ -17,6 +17,7 @@ Public symbols:
 - :class:`PdfEmbed` — one PDF embed: the hosting block's uid and the PDF's storage URL.
 - :class:`PdfStatus` — the outcome of one PDF's extraction.
 - :class:`PdfText` — one cached extraction result.
+- :class:`PdfFetchBudget` — how much one run may fetch: PDFs, bytes, seconds.
 - :class:`ExtractionSummary` — what an extraction run did, by count.
 - :data:`EXTRACTOR_VERSION` — the extraction logic's version; a bump re-extracts.
 - :data:`NO_TEXT_PAGE_MIN_CHARS` — the non-whitespace chars a page needs to count as text.
@@ -38,6 +39,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import time
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -51,7 +53,7 @@ import requests
 from guffin.roam.asset import RoamAsset
 from guffin.roam.graph_source import GraphSource
 from guffin.roam.markdown import PDF_EMBED_RE
-from pydantic import BaseModel, ConfigDict, HttpUrl, ValidationError, validate_call
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, validate_call
 
 logger = logging.getLogger(__name__)
 
@@ -145,14 +147,44 @@ class PdfText(BaseModel):
     extracted_at: str
 
 
+class PdfFetchBudget(BaseModel):
+    """How much one run may fetch through Roam Desktop; ``None`` leaves a bound off.
+
+    A run checks the budget before each fetch and stops once any bound is reached, so the
+    fetch that crosses the byte or time bound completes.  Bytes matter as well as counts:
+    every PDF crosses Roam Desktop's main process as one base64 string, and a run moving
+    ~1.3 GB through a long-lived Roam process crashed it (design plan, 5b).
+
+    Attributes:
+        max_pdfs: The most PDFs to fetch.
+        max_bytes: Stop once this many decrypted bytes have been fetched.
+        max_seconds: Stop once the run has spent this long fetching and extracting.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    max_pdfs: int | None = Field(default=None, ge=0)
+    max_bytes: int | None = Field(default=None, ge=0)
+    max_seconds: float | None = Field(default=None, ge=0)
+
+    def exhausted(self, fetched: int, fetched_bytes: int, elapsed_seconds: float) -> bool:
+        """Whether a run that has fetched this much, this long, must stop before the next fetch."""
+        return (
+            (self.max_pdfs is not None and fetched >= self.max_pdfs)
+            or (self.max_bytes is not None and fetched_bytes >= self.max_bytes)
+            or (self.max_seconds is not None and elapsed_seconds >= self.max_seconds)
+        )
+
+
 class ExtractionSummary(BaseModel):
     """What an extraction run did, by count.
 
     Attributes:
-        distinct_count: Distinct PDF URLs the graph embeds.
+        distinct_count: Distinct PDF URLs among the embeds the run was given.
         current_count: PDFs whose cached entry needed no work this run.
         outcomes: This run's extractions by resulting status.
-        pending_count: PDFs still needing extraction after the run (a ``limit`` held them back).
+        fetched_bytes: Decrypted bytes this run fetched.
+        pending_count: PDFs still needing extraction after the run (the budget held them back).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -160,6 +192,7 @@ class ExtractionSummary(BaseModel):
     distinct_count: int
     current_count: int
     outcomes: dict[PdfStatus, int]
+    fetched_bytes: int = 0
     pending_count: int
 
     @property
@@ -394,14 +427,15 @@ def extract_pdf_texts(
     embeds: Sequence[PdfEmbed],
     source: GraphSource,
     retry_failed: bool = False,
-    limit: int | None = None,
+    budget: PdfFetchBudget | None = None,
 ) -> ExtractionSummary:
     """Fetch and extract every embedded PDF the cache lacks, caching each result as it lands.
 
     Each distinct URL is visited once, in embed order.  A URL is fetched when the cache has
     no entry for it, when its entry came from an older extractor, or — with *retry_failed* —
     when its fetch or parse failed; a password-protected PDF is never refetched.  Every
-    result is committed as soon as it lands, so an interrupted run keeps its progress.
+    result is committed as soon as it lands, so an interrupted run keeps its progress, and
+    a *budget* stops the run early, leaving the rest pending for the next one.
 
     A run of :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` failed fetches in a row means the graph
     itself is failing (closed, or locked mid-run), not its files: the run aborts *without*
@@ -412,7 +446,7 @@ def extract_pdf_texts(
         embeds: The graph's PDF embeds (:func:`pdf_embeds`).
         source: The graph source the PDFs are fetched from.
         retry_failed: Whether to refetch PDFs whose fetch or parse failed before.
-        limit: The most PDFs to fetch this run; ``None`` fetches all that need it.
+        budget: How much the run may fetch; ``None`` fetches everything that needs it.
 
     Returns:
         The run's summary.
@@ -421,16 +455,24 @@ def extract_pdf_texts(
         RuntimeError: If :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` fetches fail in a row.
     """
     urls: Final[list[str]] = list(dict.fromkeys(embed.url for embed in embeds))
+    bounds: Final[PdfFetchBudget] = budget if budget is not None else PdfFetchBudget()
     connection: Final[sqlite3.Connection] = _connected_cache(cache_path)
+    started: Final[float] = time.monotonic()
+    fetched: int = 0
+    fetched_bytes: int = 0
     try:
         cached: Final[dict[str, PdfText]] = _read_entries(connection)
         due: Final[list[str]] = [url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed)]
-        selected: Final[list[str]] = due if limit is None else due[:limit]
-        logger.info("%d distinct PDFs; %d need extraction, fetching %d", len(urls), len(due), len(selected))
+        logger.info("%d distinct PDFs; %d need extraction", len(urls), len(due))
         outcomes: Final[Counter[PdfStatus]] = Counter()
         failure_run: Final[list[tuple[str, PdfText]]] = []
-        for position, url in enumerate(selected, start=1):
+        for url in due:
+            if bounds.exhausted(fetched, fetched_bytes, time.monotonic() - started):
+                logger.info("fetch budget reached after %d PDFs (%d bytes)", fetched, fetched_bytes)
+                break
             entry: PdfText = _fetched_entry(source, url)
+            fetched += 1
+            fetched_bytes += entry.byte_count or 0
             if entry.status is PdfStatus.FETCH_FAILED:
                 failure_run.append((url, entry))
                 if len(failure_run) >= CONSECUTIVE_FETCH_FAILURE_LIMIT:
@@ -445,8 +487,8 @@ def extract_pdf_texts(
             failure_run.clear()
             _write_entry(connection, url_key(url), entry)
             outcomes[entry.status] += 1
-            if position % _PROGRESS_INTERVAL == 0:
-                logger.info("extracted %d/%d PDFs", position, len(selected))
+            if fetched % _PROGRESS_INTERVAL == 0:
+                logger.info("extracted %d/%d PDFs", fetched, len(due))
         for failed_url, failed_entry in failure_run:
             _write_entry(connection, url_key(failed_url), failed_entry)
             outcomes[failed_entry.status] += 1
@@ -456,5 +498,6 @@ def extract_pdf_texts(
         distinct_count=len(urls),
         current_count=len(urls) - len(due),
         outcomes=dict(outcomes),
-        pending_count=len(due) - len(selected),
+        fetched_bytes=fetched_bytes,
+        pending_count=len(due) - fetched,
     )

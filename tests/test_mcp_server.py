@@ -10,6 +10,7 @@ from roam_semantic_search import mcp_server
 from roam_semantic_search.graph_registry import RegisteredGraph
 from roam_semantic_search.graph_windows import WindowState
 from roam_semantic_search.mcp_server import AutoRefresh, RefreshOutcome, _require_open_window, index_age_seconds
+from roam_semantic_search.refresh import INTERACTIVE_MAX_PDF_EMBEDS, INTERACTIVE_PDF_FETCH_BUDGET, RefreshSummary
 from roam_semantic_search.store import StoreMeta
 
 NOW: Final[datetime] = datetime(2026, 8, 7, 18, 0, 0, tzinfo=UTC)
@@ -150,3 +151,30 @@ class TestEnsuredFreshWindowGate:
         outcome: Final[AutoRefresh] = mcp_server._ensured_fresh("SCFH", Path("ignored.db"))
         assert outcome.outcome is RefreshOutcome.REFRESHED
         assert reached == ["SCFH"]
+
+
+class TestInteractivePdfBudget:
+    """Every refresh the server runs carries the interactive PDF budget, and reports what it left."""
+
+    def test_auto_refresh_is_budgeted_and_reports_the_remainder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub_auto_refresh(monkeypatch, WindowState.OPEN, required=True)
+        received: Final[dict[str, object]] = {}
+        leftover: Final[RefreshSummary] = RefreshSummary(
+            embedded_count=250,
+            deleted_count=0,
+            unchanged_count=10,
+            record_count=260,
+            pdf_fetched_count=10,
+            pdf_pending_count=40,
+            embed_deferred_count=900,
+        )
+
+        def refresh_store(db_path: Path, endpoint: str, **kwargs: object) -> RefreshSummary:
+            received.update(kwargs)
+            return leftover
+
+        monkeypatch.setattr(mcp_server, "refresh_store", refresh_store)
+        outcome: Final[AutoRefresh] = mcp_server._ensured_fresh("hippo", Path("ignored.db"))
+        assert received["pdf_fetch_budget"] == INTERACTIVE_PDF_FETCH_BUDGET
+        assert received["max_pdf_embeds"] == INTERACTIVE_MAX_PDF_EMBEDS
+        assert outcome.summary == leftover

@@ -17,6 +17,7 @@ from roam_semantic_search.pdf_text import (
     CONSECUTIVE_FETCH_FAILURE_LIMIT,
     ExtractionSummary,
     PdfEmbed,
+    PdfFetchBudget,
     PdfStatus,
     PdfText,
     cached_pdf_texts,
@@ -239,7 +240,7 @@ class TestExtractPdfTexts:
         names: Final[list[str]] = ["a.pdf", "b.pdf", "c.pdf"]
         source: Final[FakeSource] = FakeSource(files={url(name): pdf_bytes([_LINE_ONE]) for name in names})
         summary: Final[ExtractionSummary] = extract_pdf_texts(
-            cache, embeds(*(url(name) for name in names)), source, limit=2
+            cache, embeds(*(url(name) for name in names)), source, budget=PdfFetchBudget(max_pdfs=2)
         )
         assert source.fetched == [url("a.pdf"), url("b.pdf")]
         assert summary.pending_count == 1
@@ -275,3 +276,34 @@ class TestExtractPdfTexts:
         cache.chmod(0o644)
         extract_pdf_texts(cache, [], FakeSource(files={}))
         assert stat.S_IMODE(cache.stat().st_mode) == 0o600
+
+
+class TestFetchBudget:
+    def test_byte_budget_stops_after_the_crossing_fetch(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        names: Final[list[str]] = ["a.pdf", "b.pdf", "c.pdf"]
+        files: Final[dict[str, bytes]] = {url(name): pdf_bytes([_LINE_ONE]) for name in names}
+        one_file: Final[int] = len(files[url("a.pdf")])
+        source: Final[FakeSource] = FakeSource(files=files)
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            cache, embeds(*(url(name) for name in names)), source, budget=PdfFetchBudget(max_bytes=one_file + 1)
+        )
+        assert source.fetched == [url("a.pdf"), url("b.pdf")]
+        assert summary.fetched_bytes == 2 * one_file
+        assert summary.pending_count == 1
+
+    def test_spent_time_budget_fetches_nothing(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        source: Final[FakeSource] = FakeSource(files={url("a.pdf"): pdf_bytes([_LINE_ONE])})
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            cache, embeds(url("a.pdf")), source, budget=PdfFetchBudget(max_seconds=0)
+        )
+        assert source.fetched == []
+        assert summary.pending_count == 1
+
+    def test_exhausted_checks_each_bound(self) -> None:
+        assert not PdfFetchBudget().exhausted(10_000, 10**12, 10**6)
+        assert PdfFetchBudget(max_pdfs=3).exhausted(3, 0, 0)
+        assert not PdfFetchBudget(max_pdfs=3).exhausted(2, 0, 0)
+        assert PdfFetchBudget(max_bytes=100).exhausted(1, 100, 0)
+        assert PdfFetchBudget(max_seconds=5).exhausted(1, 0, 5.0)

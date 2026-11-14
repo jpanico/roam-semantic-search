@@ -20,6 +20,7 @@ Public symbols:
 - :class:`IndexRecord` — one embeddable record: identity, context, text, hash, bookkeeping.
 - :func:`normalized_records` — pull-block rows → the records worth indexing.
 - :func:`pdf_chunk_records` — pull-block rows + cached PDF text → one record per chunk.
+- :func:`indexable_pdf_embeds` — the PDF embeds whose chunks the index would hold.
 - :data:`PDF_CHUNK_MAX_CHARS` / :data:`PDF_CHUNK_OVERLAP_CHARS` — the PDF chunking sizes.
 - :data:`SKIPPED_PAGE_PREFIXES` — page-title prefixes excluded from the index (with their blocks).
 - :data:`REF_PREVIEW_MAX_CHARS` — length cap on a resolved block reference's inserted text.
@@ -37,7 +38,7 @@ from guffin.model.primitives import DAILY_NOTE_UID_PATTERN, UID_PATTERN
 from pydantic import BaseModel, ConfigDict, validate_call
 
 from roam_semantic_search.json_narrowing import is_json_list, is_json_object
-from roam_semantic_search.pdf_text import PdfStatus, PdfText, pdf_embeds, url_key
+from roam_semantic_search.pdf_text import PdfEmbed, PdfStatus, PdfText, pdf_embeds, url_key
 
 SKIPPED_PAGE_PREFIXES: Final[tuple[str, ...]] = ("roam/",)
 """Page-title prefixes whose pages (and all their blocks) are excluded from the index."""
@@ -570,6 +571,31 @@ def _indexable_page_dbids(rows: Sequence[Mapping[str, object]], include_daily_no
         if "title" in row and isinstance(row_id, int) and _is_indexable_page(row, include_daily_notes):
             dbids.add(row_id)
     return dbids
+
+
+@validate_call
+def indexable_pdf_embeds(rows: Sequence[dict[str, object]], include_daily_notes: bool = True) -> list[PdfEmbed]:
+    """The PDF embeds of blocks on indexable pages — the PDFs whose text the index would hold.
+
+    A refresh fetches only these, so a ``--no-daily-notes`` index never spends its fetch
+    budget on PDFs it would not index.
+
+    Args:
+        rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
+        include_daily_notes: Whether daily-note pages count as indexable.
+
+    Returns:
+        The embeds, in row order.
+    """
+    indexable_page_dbids: Final[set[int]] = _indexable_page_dbids(rows, include_daily_notes)
+    hosts: Final[list[dict[str, object]]] = [
+        row
+        for row in rows
+        if isinstance(row.get("string"), str)
+        and (page_id := _stub_id(row, "page")) is not None
+        and page_id in indexable_page_dbids
+    ]
+    return pdf_embeds(hosts)
 
 
 @validate_call

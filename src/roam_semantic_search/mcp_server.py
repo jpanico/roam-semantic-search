@@ -25,6 +25,12 @@ graph configuration of its own.  The remaining environment variables are:
   :mod:`roam_semantic_search.graph_windows`).  An explicit ``refresh_index`` call is
   never gated — asking for it is deliberate.
 
+Every refresh this server runs — automatic or ``refresh_index`` — carries the interactive
+PDF budget (:data:`~roam_semantic_search.refresh.INTERACTIVE_PDF_FETCH_BUDGET` and
+:data:`~roam_semantic_search.refresh.INTERACTIVE_MAX_PDF_EMBEDS`): it fetches and embeds a
+bounded slice of any PDF backlog and reports the remainder, so no call waits on minutes of
+PDF work.  The CLI's ``refresh`` and ``extract-pdfs`` work a backlog through.
+
 A search answers from the index — a snapshot — never from the live graph.  To bound how
 stale an answer can be, ``semantic_search`` first auto-refreshes the index when its last
 capture is older than the staleness threshold; a failed refresh (most commonly Roam
@@ -49,7 +55,12 @@ from roam_semantic_search.embed import DEFAULT_OLLAMA_URL
 from roam_semantic_search.graph_registry import RegisteredGraph, api_endpoint_for, registered_graphs, resolve_graph
 from roam_semantic_search.graph_windows import WindowState, window_state_for
 from roam_semantic_search.query import SearchHit, search_store
-from roam_semantic_search.refresh import RefreshSummary, refresh_store
+from roam_semantic_search.refresh import (
+    INTERACTIVE_MAX_PDF_EMBEDS,
+    INTERACTIVE_PDF_FETCH_BUDGET,
+    RefreshSummary,
+    refresh_store,
+)
 from roam_semantic_search.store import StoreMeta, default_db_path, read_meta
 
 logger = logging.getLogger(__name__)
@@ -93,6 +104,8 @@ class AutoRefresh(BaseModel):
         threshold_seconds: The staleness threshold the age was judged against.
         error: Why a refresh failed, when one did — most commonly Roam Desktop not
             running; the search then answered from the existing snapshot.
+        summary: What a refresh that ran did, including any PDF work it left pending
+            (``pdf_pending_count``, ``embed_deferred_count``) for a later refresh.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -101,6 +114,7 @@ class AutoRefresh(BaseModel):
     age_seconds: float | None
     threshold_seconds: int
     error: str | None = None
+    summary: RefreshSummary | None = None
 
 
 class SearchResponse(BaseModel):
@@ -214,13 +228,24 @@ def _ensured_fresh(graph: str, db_path: Path) -> AutoRefresh:
         return AutoRefresh(outcome=RefreshOutcome.WINDOW_CLOSED, age_seconds=age, threshold_seconds=threshold)
 
     try:
-        refresh_store(db_path, api_endpoint_for(resolved), ollama_url=_ollama_url())
+        summary: Final[RefreshSummary | None] = _interactive_refresh(db_path, resolved)
     except Exception as exc:  # noqa: BLE001 — degrade to the snapshot, whatever the cause
         logger.warning("auto-refresh of %r failed; answering from the snapshot: %s", graph, exc)
         return AutoRefresh(
             outcome=RefreshOutcome.REFRESH_FAILED, age_seconds=age, threshold_seconds=threshold, error=str(exc)
         )
-    return AutoRefresh(outcome=RefreshOutcome.REFRESHED, age_seconds=age, threshold_seconds=threshold)
+    return AutoRefresh(outcome=RefreshOutcome.REFRESHED, age_seconds=age, threshold_seconds=threshold, summary=summary)
+
+
+def _interactive_refresh(db_path: Path, graph: RegisteredGraph) -> RefreshSummary:
+    """Refresh *graph*'s store under the interactive PDF budget."""
+    return refresh_store(
+        db_path,
+        api_endpoint_for(graph),
+        ollama_url=_ollama_url(),
+        pdf_fetch_budget=INTERACTIVE_PDF_FETCH_BUDGET,
+        max_pdf_embeds=INTERACTIVE_MAX_PDF_EMBEDS,
+    )
 
 
 def _store_for(graph: str) -> Path:
@@ -309,9 +334,11 @@ def refresh_index(graph: str) -> RefreshSummary:
 
     Fetches the whole graph through the Roam Local API (Roam Desktop must be
     running), re-embeds only records whose content changed, and deletes records
-    whose entities vanished.  Attached PDFs are indexed from the graph's PDF text
-    cache (filled by the ``extract-pdfs`` command); this tool fetches no PDFs.
-    Typically answers in a few seconds; the no-change case is around two.
+    whose entities vanished.  New attached PDFs are fetched and embedded within a
+    bounded budget (about ten PDFs and 250 passages per call); the summary's
+    ``pdf_pending_count`` and ``embed_deferred_count`` report what is left, which a
+    later call — or the CLI's ``refresh`` — picks up.  Typically answers in a few
+    seconds; the no-change case is around two.
 
     Args:
         graph: Which graph to refresh, by nickname — see ``list_indexes``.
@@ -319,8 +346,7 @@ def refresh_index(graph: str) -> RefreshSummary:
     Returns:
         Counts of what the refresh embedded, deleted, and left untouched.
     """
-    resolved: Final[RegisteredGraph] = resolve_graph(graph)
-    return refresh_store(_store_for(graph), api_endpoint_for(resolved), ollama_url=_ollama_url())
+    return _interactive_refresh(_store_for(graph), resolve_graph(graph))
 
 
 @server.tool()

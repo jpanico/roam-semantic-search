@@ -27,11 +27,13 @@ them (see :mod:`roam_semantic_search.graph_windows`).
 import logging
 import os
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Final
 
 import numpy as np
+import requests
 import typer
 from guffin.roam.local_api import ApiEndpoint
 from guffin.roam.local_api_source import LocalApiGraphSource
@@ -41,10 +43,17 @@ from roam_semantic_search.embed import DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, 
 from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.graph_registry import RegisteredGraph, local_api_port, registered_graphs, resolve_graph
 from roam_semantic_search.graph_windows import WindowState, window_state_for
-from roam_semantic_search.normalize import IndexRecord, RecordKind, normalized_records, pdf_chunk_records
+from roam_semantic_search.normalize import (
+    IndexRecord,
+    RecordKind,
+    indexable_pdf_embeds,
+    normalized_records,
+    pdf_chunk_records,
+)
 from roam_semantic_search.pdf_text import (
     ExtractionSummary,
     PdfEmbed,
+    PdfFetchBudget,
     cached_pdf_texts,
     default_pdf_cache_path,
     extract_pdf_texts,
@@ -77,8 +86,19 @@ PdfCacheOption = Annotated[
     ),
 ]
 IncludePdfsOption = Annotated[
-    bool, typer.Option("--pdfs/--no-pdfs", help="Index attached PDFs' cached text (cached by extract-pdfs)")
+    bool, typer.Option("--pdfs/--no-pdfs", help="Index attached PDFs' text, fetching new ones within the budget")
 ]
+MaxPdfsOption = Annotated[int | None, typer.Option("--max-pdfs", min=0, help="Fetch at most this many PDFs")]
+MaxPdfMbOption = Annotated[
+    float,
+    typer.Option(
+        "--max-pdf-mb",
+        min=0,
+        help="Stop fetching PDFs once this many MB have crossed Roam Desktop (a large run once crashed it)",
+    ),
+]
+DEFAULT_MAX_PDF_MB: Final[float] = 500.0
+"""A CLI run's default PDF byte budget: well under the ~1.3 GB after which a run crashed Roam Desktop."""
 RequireOpenWindowOption = Annotated[
     bool,
     typer.Option(
@@ -117,6 +137,27 @@ def _store_path(selector: str, db_path: Path | None) -> Path:
 def _pdf_cache_path(selector: str, cache_path: Path | None) -> Path:
     """The PDF text cache to use: an explicit ``--pdf-cache``, else the graph's default location."""
     return cache_path if cache_path is not None else default_pdf_cache_path(_canonical_graph_name(selector))
+
+
+def _fetch_budget(max_pdfs: int | None, max_pdf_mb: float) -> PdfFetchBudget:
+    """The PDF fetch budget the ``--max-pdfs`` / ``--max-pdf-mb`` options describe."""
+    return PdfFetchBudget(max_pdfs=max_pdfs, max_bytes=int(max_pdf_mb * 1_000_000))
+
+
+def _outcomes(summary: ExtractionSummary) -> str:
+    """An extraction's outcomes as ``"3 no-text, 12 ok"``, or ``"none"``."""
+    return ", ".join(f"{count} {status}" for status, count in sorted(summary.outcomes.items())) or "none"
+
+
+def _fetch_pdfs(
+    cache_path: Path, embeds: Sequence[PdfEmbed], api_endpoint: ApiEndpoint, budget: PdfFetchBudget
+) -> ExtractionSummary | None:
+    """Fetch what the cache lacks within *budget*, reporting a failure rather than raising it."""
+    try:
+        return extract_pdf_texts(cache_path, embeds, LocalApiGraphSource(api_endpoint=api_endpoint), budget=budget)
+    except (RuntimeError, requests.exceptions.RequestException) as error:
+        typer.echo(f"fetching PDFs failed; indexing the cached PDF text only: {error}", err=True)
+        return None
 
 
 def _api_endpoint(selector: str, port: int | None, token: str | None) -> ApiEndpoint:
@@ -183,11 +224,13 @@ def build(
     include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
     include_pdfs: IncludePdfsOption = True,
     pdf_cache_path: PdfCacheOption = None,
+    max_pdfs: MaxPdfsOption = None,
+    max_pdf_mb: MaxPdfMbOption = DEFAULT_MAX_PDF_MB,
 ) -> None:
     """Fetch the graph, normalize, embed locally, and (re)write the index store.
 
-    Attached PDFs are indexed from the PDF text cache that ``extract-pdfs`` fills; a PDF
-    the cache lacks gets no records (nothing here fetches PDFs).
+    Attached PDFs the PDF text cache lacks are fetched first, within ``--max-pdfs`` and
+    ``--max-pdf-mb``; any left over are indexed by a later ``refresh`` or ``extract-pdfs``.
     """
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
     resolved_db: Final[Path] = _store_path(graph, db_path)
@@ -196,13 +239,19 @@ def build(
     rows: Final[list[dict[str, object]]] = fetch_graph(api_endpoint)
     records: Final[list[IndexRecord]] = normalized_records(rows, include_daily_notes=include_daily_notes)
     if include_pdfs:
-        records.extend(
-            pdf_chunk_records(
-                rows,
-                cached_pdf_texts(_pdf_cache_path(graph, pdf_cache_path)),
-                include_daily_notes=include_daily_notes,
-            )
+        cache: Final[Path] = _pdf_cache_path(graph, pdf_cache_path)
+        extraction: Final[ExtractionSummary | None] = _fetch_pdfs(
+            cache,
+            indexable_pdf_embeds(rows, include_daily_notes=include_daily_notes),
+            api_endpoint,
+            _fetch_budget(max_pdfs, max_pdf_mb),
         )
+        if extraction is not None:
+            typer.echo(
+                f"PDFs: fetched {extraction.extracted_count} ({_outcomes(extraction)}),"
+                f" {extraction.pending_count} pending"
+            )
+        records.extend(pdf_chunk_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
     pdf_count: Final[int] = sum(1 for record in records if record.kind is RecordKind.PDF)
     typer.echo(f"fetched {len(rows)} entities; {len(records)} indexable records ({pdf_count} PDF chunks)")
 
@@ -257,12 +306,19 @@ def refresh(
     include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
     include_pdfs: IncludePdfsOption = True,
     pdf_cache_path: PdfCacheOption = None,
+    max_pdfs: MaxPdfsOption = None,
+    max_pdf_mb: MaxPdfMbOption = DEFAULT_MAX_PDF_MB,
+    max_pdf_embeds: Annotated[
+        int | None, typer.Option("--max-pdf-embeds", min=0, help="Embed at most this many PDF passages")
+    ] = None,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
     """Incrementally update the store: re-embed only changed records, delete vanished ones.
 
-    Attached PDFs are indexed from the PDF text cache (``extract-pdfs``); a schema-v2 store
-    is upgraded in place first, embeddings kept.
+    Attached PDFs the PDF text cache lacks are fetched first, within ``--max-pdfs`` and
+    ``--max-pdf-mb``; ``--max-pdf-embeds`` caps how many PDF passages are embedded, the rest
+    waiting for the next refresh (page and block edits are never held back).  A schema-v2
+    store is upgraded in place first, embeddings kept.
 
     Fetching reaches the graph through the Roam Local API, and a request naming a graph Roam
     Desktop cannot serve makes it open a window — an unlock prompt, for an encrypted graph.
@@ -285,6 +341,8 @@ def refresh(
         include_daily_notes=include_daily_notes,
         include_pdfs=include_pdfs,
         pdf_cache_path=_pdf_cache_path(graph, pdf_cache_path),
+        pdf_fetch_budget=_fetch_budget(max_pdfs, max_pdf_mb),
+        max_pdf_embeds=max_pdf_embeds,
     )
     elapsed: Final[float] = time.perf_counter() - started
     typer.echo(
@@ -292,6 +350,13 @@ def refresh(
         f" {summary.deleted_count} deleted, {summary.unchanged_count} unchanged"
         f" ({summary.record_count} records)"
     )
+    if include_pdfs:
+        typer.echo(
+            f"PDFs: {summary.pdf_fetched_count} fetched, {summary.pdf_pending_count} still to fetch,"
+            f" {summary.embed_deferred_count} passages left to embed"
+        )
+    if summary.pdf_error is not None:
+        typer.echo(f"fetching PDFs failed; indexed the cached PDF text only: {summary.pdf_error}", err=True)
 
 
 @app.command("extract-pdfs")
@@ -303,14 +368,16 @@ def extract_pdfs(
     retry_failed: Annotated[
         bool, typer.Option("--retry-failed", help="Refetch PDFs whose fetch or parse failed before")
     ] = False,
-    limit: Annotated[int | None, typer.Option("--limit", min=1, help="Fetch at most this many PDFs")] = None,
+    max_pdfs: MaxPdfsOption = None,
+    max_pdf_mb: MaxPdfMbOption = DEFAULT_MAX_PDF_MB,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
     """Fetch the graph's attached PDFs and cache their text, for indexing.
 
     Every PDF a block embeds is fetched decrypted through the Roam Local API, held in memory
     only, and its text layer cached page by page in an owner-only file; already-cached PDFs
-    are skipped, so a run picks up where the last one stopped.  Reaching the graph can make
+    are skipped, so a run picks up where the last one stopped, and ``--max-pdfs`` /
+    ``--max-pdf-mb`` bound one run.  Reaching the graph can make
     Roam Desktop open a window for it — see ``refresh`` for ``--require-open-window``.
     """
     if require_open_window and _open_window_refused(graph):
@@ -325,19 +392,16 @@ def extract_pdfs(
             embeds,
             LocalApiGraphSource(api_endpoint=api_endpoint),
             retry_failed=retry_failed,
-            limit=limit,
+            budget=_fetch_budget(max_pdfs, max_pdf_mb),
         )
     except RuntimeError as error:
         typer.echo(f"aborted: {error}", err=True)
         raise typer.Exit(code=1) from error
     elapsed: Final[float] = time.perf_counter() - started
-    outcomes: Final[str] = (
-        ", ".join(f"{count} {status}" for status, count in sorted(summary.outcomes.items())) or "none"
-    )
     typer.echo(
         f"{resolved_cache}: {summary.distinct_count} distinct PDFs in {len(embeds)} embeds;"
-        f" extracted {summary.extracted_count} in {elapsed:.1f}s ({outcomes});"
-        f" {summary.current_count} already current, {summary.pending_count} pending"
+        f" extracted {summary.extracted_count} ({summary.fetched_bytes / 1_000_000:.0f} MB) in {elapsed:.1f}s"
+        f" ({_outcomes(summary)}); {summary.current_count} already current, {summary.pending_count} pending"
     )
 
 

@@ -141,8 +141,9 @@ does not know about.
 
 ### PDF attachments: `extract-pdfs`
 
-Searching inside attached PDFs takes two steps: `extract-pdfs` caches their text, and
-the next `build` or `refresh` indexes it (`--no-pdfs` leaves PDFs out). It fetches every
+`build` and `refresh` index attached PDFs (`--no-pdfs` leaves them out): each first
+fetches the PDFs its text cache lacks, within a budget, then indexes the cached text.
+`extract-pdfs` does only the fetching, for working a large backlog. Fetching takes every
 PDF a block embeds (`{{pdf: …}}` / `{{[[pdf]]: …}}`) through the Local API — decrypted, for
 an encrypted graph — holds it in memory only, and caches its text layer page by page in
 `~/.cache/roam-semantic-search/<graph>.pdf-text.db` (`--pdf-cache` overrides, on all three
@@ -150,21 +151,23 @@ commands). That file holds
 decrypted text, so it is created owner-only (`0600`); no PDF bytes are written to disk, and
 entries are keyed by a digest of the URL rather than the URL (which embeds an access token).
 
-A run skips every PDF already cached, so it resumes where the last one stopped; `--limit N`
-caps a run. Each PDF lands as `ok`, `no-text` (a scan, awaiting OCR), `password`,
+A run skips every PDF already cached, so it resumes where the last one stopped.
+`--max-pdfs N` and `--max-pdf-mb N` bound one run's fetching (default 500 MB) on all three
+commands; `refresh --max-pdf-embeds N` also caps how many PDF passages it embeds, leaving
+the rest for the next refresh (page and block edits are never held back). Each PDF lands as `ok`, `no-text` (a scan, awaiting OCR), `password`,
 `parse-failed`, or `fetch-failed`. A password-protected PDF is never refetched — an upload
 never changes — while `--retry-failed` refetches the two failure kinds. Five fetch failures
 in a row abort the run without caching them: at that point the graph, not its files, is
 failing. Like `refresh`, it takes `--require-open-window`.
 
-**Work a large backlog in batches.** Every PDF passes through Roam Desktop as one base64
-string, and on 2026-11-13 an unbatched first run crashed Roam Desktop after ~1.3 GB (about
-1,250 PDFs). Until that is understood, prefer `--limit 200` runs; each one resumes where
-the last stopped.
+**Why the byte budget.** Every PDF passes through Roam Desktop as one base64 string, and on
+2026-11-13 an unbudgeted first run crashed Roam Desktop after ~1.3 GB (about 1,250 PDFs).
+A run that stops at its budget reports what is pending; run it again to continue.
 
-**Embed a large batch from the CLI.** After an `extract-pdfs` run that adds many PDFs,
-run `refresh` yourself: otherwise the MCP server's next pre-search auto-refresh embeds
-every new chunk before answering (hippo's ~10,400 chunks take ~10 minutes).
+**Work a large backlog from the CLI.** The MCP server's refreshes take only a small slice
+of any PDF backlog per call (10 PDFs, 50 MB, 250 passages), so a search never waits on
+minutes of PDF work; after adding many PDFs, run `extract-pdfs` and `refresh` yourself
+(hippo's ~11,000 passages took ~11 minutes to embed).
 
 ### Unattended refreshes: `--require-open-window`
 
@@ -232,6 +235,10 @@ client, with four tools:
 A hit's `kind` is `page`, `block`, or `pdf`. A `pdf` hit is a passage of an attached PDF:
 its `uid` is the block that embeds the PDF, and `pdf_name` and `pdf_page` say which PDF
 and page. Each PDF appears at most once, as its best-matching passage.
+
+Every refresh the server runs carries a small PDF budget — 10 PDFs, 50 MB, 15 s, and 250
+passage embeddings — and its summary reports `pdf_pending_count` and
+`embed_deferred_count`, the PDF work left for later (also in a search's `refresh.summary`).
 
 **Staleness is bounded, and never silent.** `semantic_search` answers from the index — a
 snapshot — but when the last capture is older than the staleness threshold

@@ -9,7 +9,7 @@ from typer.testing import CliRunner
 
 from roam_semantic_search import cli
 from roam_semantic_search.graph_windows import WindowState
-from roam_semantic_search.pdf_text import ExtractionSummary, PdfStatus
+from roam_semantic_search.pdf_text import ExtractionSummary, PdfFetchBudget, PdfStatus
 from roam_semantic_search.refresh import RefreshSummary
 
 runner: Final[CliRunner] = CliRunner()
@@ -144,3 +144,52 @@ class TestExtractPdfs:
         result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--pdf-cache", str(tmp_path / "c.db")])
         assert result.exit_code == 1
         assert "aborted" in result.output
+
+
+class TestPdfBudgetOptions:
+    """The CLI's PDF budget: 500 MB by default on every command that fetches, overridable."""
+
+    def test_refresh_fetches_within_the_default_byte_budget(self, store: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        received: Final[dict[str, object]] = {}
+
+        def refresh_store(db_path: Path, endpoint: str, **kwargs: object) -> RefreshSummary:
+            received.update(kwargs)
+            return SUMMARY
+
+        def api_endpoint(selector: str, port: int | None, token: str | None) -> str:
+            return "endpoint"
+
+        monkeypatch.setattr(cli, "refresh_store", refresh_store)
+        monkeypatch.setattr(cli, "_api_endpoint", api_endpoint)
+        result = runner.invoke(cli.app, ["refresh", "--graph", "SCFH", "--db", str(store), "--max-pdf-embeds", "7"])
+        assert result.exit_code == 0
+        assert received["pdf_fetch_budget"] == PdfFetchBudget(max_bytes=500_000_000)
+        assert received["max_pdf_embeds"] == 7
+        assert "PDFs: 0 fetched" in result.output
+
+    def test_extract_pdfs_takes_count_and_byte_bounds(
+        self, tmp_path: Path, pdf_run: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        received: Final[dict[str, object]] = {}
+
+        def extract_pdf_texts(*args: object, **kwargs: object) -> ExtractionSummary:
+            received.update(kwargs)
+            return ExtractionSummary(distinct_count=0, current_count=0, outcomes={}, pending_count=0)
+
+        monkeypatch.setattr(cli, "extract_pdf_texts", extract_pdf_texts)
+        result = runner.invoke(
+            cli.app,
+            [
+                "extract-pdfs",
+                "--graph",
+                "SCFH",
+                "--pdf-cache",
+                str(tmp_path / "c.db"),
+                "--max-pdfs",
+                "3",
+                "--max-pdf-mb",
+                "1.5",
+            ],
+        )
+        assert result.exit_code == 0
+        assert received["budget"] == PdfFetchBudget(max_pdfs=3, max_bytes=1_500_000)
