@@ -1,5 +1,6 @@
 """Tests for roam_semantic_search.pdf_text."""
 
+import sqlite3
 import stat
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -13,8 +14,10 @@ from guffin.roam.graph_source import DatalogQuery, DatalogRows, GraphSource
 from pydantic import ConfigDict, Field, HttpUrl
 
 from roam_semantic_search import pdf_text
+from roam_semantic_search.ocr import OCR_VERSION, ocr_available
 from roam_semantic_search.pdf_text import (
     CONSECUTIVE_FETCH_FAILURE_LIMIT,
+    ExtractedText,
     ExtractionSummary,
     PdfEmbed,
     PdfFetchBudget,
@@ -137,30 +140,30 @@ class TestPdfEmbeds:
 
 class TestExtractedText:
     def test_text_layer_per_page(self) -> None:
-        status, pages, error = extracted_text(pdf_bytes([_LINE_ONE, _LINE_TWO]))
+        status, pages, error, _ = extracted_text(pdf_bytes([_LINE_ONE, _LINE_TWO]))
         assert status is PdfStatus.OK
         assert pages == (_LINE_ONE, _LINE_TWO)
         assert error is None
 
     def test_short_or_blank_page_counts_as_no_text(self) -> None:
-        status, pages, _ = extracted_text(pdf_bytes([_LINE_ONE, "", "p. 3"]))
+        status, pages, _, _ = extracted_text(pdf_bytes([_LINE_ONE, "", "p. 3"]))
         assert status is PdfStatus.OK
         assert pages == (_LINE_ONE, "", "")
 
     def test_scan_without_any_text_layer(self) -> None:
-        status, pages, error = extracted_text(pdf_bytes(["", ""]))
+        status, pages, error, _ = extracted_text(pdf_bytes(["", ""]))
         assert status is PdfStatus.NO_TEXT
         assert pages == ("", "")
         assert error is None
 
     def test_password_protected(self) -> None:
-        status, pages, error = extracted_text((FIXTURES / "password-protected.pdf").read_bytes())
+        status, pages, error, _ = extracted_text((FIXTURES / "password-protected.pdf").read_bytes())
         assert status is PdfStatus.PASSWORD
         assert pages == ()
         assert error is not None and "password" in error.lower()
 
     def test_unreadable_bytes(self) -> None:
-        status, pages, error = extracted_text(b"not a pdf at all")
+        status, pages, error, _ = extracted_text(b"not a pdf at all")
         assert status is PdfStatus.PARSE_FAILED
         assert pages == ()
         assert error is not None
@@ -307,3 +310,112 @@ class TestFetchBudget:
         assert not PdfFetchBudget(max_pdfs=3).exhausted(2, 0, 0)
         assert PdfFetchBudget(max_bytes=100).exhausted(1, 100, 0)
         assert PdfFetchBudget(max_seconds=5).exhausted(1, 0, 5.0)
+
+
+_SCANNED: Final[str] = "Receipt for the garden shed paint, total 42 dollars"
+"""The text rendered into fixtures/scanned.pdf, an image-only PDF (no text layer)."""
+
+
+def stub_ocr(monkeypatch: pytest.MonkeyPatch, text: str = "Text recognized from the scanned page image") -> list[int]:
+    """Make OCR available and canned; return the list each OCR'd page appends to."""
+    calls: Final[list[int]] = []
+
+    def recognized_page_text(page: object) -> str:
+        calls.append(1)
+        return text
+
+    monkeypatch.setattr(pdf_text, "ocr_available", lambda: True)
+    monkeypatch.setattr(pdf_text, "recognized_page_text", recognized_page_text)
+    return calls
+
+
+class TestOcr:
+    def test_a_scan_has_no_text_layer_without_ocr(self) -> None:
+        found: Final[ExtractedText] = extracted_text((FIXTURES / "scanned.pdf").read_bytes())
+        assert (found.status, found.page_texts, found.ocr_page_count) == (PdfStatus.NO_TEXT, ("",), 0)
+
+    @pytest.mark.skipif(not ocr_available(), reason="on-device OCR (macOS Vision via pyobjc) is unavailable")
+    def test_vision_reads_a_scanned_page(self) -> None:
+        found: Final[ExtractedText] = extracted_text((FIXTURES / "scanned.pdf").read_bytes(), ocr=True)
+        assert found.status is PdfStatus.OK
+        assert found.page_texts == (_SCANNED,)
+        assert found.ocr_page_count == 1
+
+    def test_ocr_reads_only_pages_without_a_text_layer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: Final[list[int]] = stub_ocr(monkeypatch)
+        found: Final[ExtractedText] = extracted_text(pdf_bytes([_LINE_ONE, ""]), ocr=True)
+        assert found.page_texts == (_LINE_ONE, "Text recognized from the scanned page image")
+        assert (len(calls), found.ocr_page_count) == (1, 1)
+
+    def test_ocr_that_finds_too_little_leaves_the_page_blank(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        stub_ocr(monkeypatch, text="p. 3")
+        found: Final[ExtractedText] = extracted_text(pdf_bytes(["", ""]), ocr=True)
+        assert (found.status, found.page_texts, found.ocr_page_count) == (PdfStatus.NO_TEXT, ("", ""), 0)
+
+    def test_an_ocr_run_refetches_unread_scans_once(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        files: Final[dict[str, bytes]] = {url("scan.pdf"): pdf_bytes([""]), url("text.pdf"): pdf_bytes([_LINE_ONE])}
+        extract_pdf_texts(cache, embeds(url("scan.pdf"), url("text.pdf")), FakeSource(files=files))
+        assert cached_pdf_texts(cache)[url_key(url("scan.pdf"))].status is PdfStatus.NO_TEXT
+
+        plain: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embeds(url("scan.pdf"), url("text.pdf")), plain)
+        assert plain.fetched == []  # without OCR, a scan is not worth refetching
+
+        stub_ocr(monkeypatch)
+        reading: Final[FakeSource] = FakeSource(files=files)
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            cache, embeds(url("scan.pdf"), url("text.pdf")), reading, ocr=True
+        )
+        assert reading.fetched == [url("scan.pdf")]  # the fully texted PDF needs no OCR
+        assert summary.ocr_page_count == 1
+        entry: Final[PdfText] = cached_pdf_texts(cache)[url_key(url("scan.pdf"))]
+        assert (entry.status, entry.ocr_version, entry.ocr_page_count) == (PdfStatus.OK, OCR_VERSION, 1)
+
+        again: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embeds(url("scan.pdf"), url("text.pdf")), again, ocr=True)
+        assert again.fetched == []
+
+    def test_a_scan_ocr_could_not_read_is_not_refetched(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        files: Final[dict[str, bytes]] = {url("blank.pdf"): pdf_bytes([""])}
+        stub_ocr(monkeypatch, text="")
+        extract_pdf_texts(cache, embeds(url("blank.pdf")), FakeSource(files=files), ocr=True)
+        again: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embeds(url("blank.pdf")), again, ocr=True)
+        assert again.fetched == []
+
+    def test_ocr_asked_for_but_unavailable_changes_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        files: Final[dict[str, bytes]] = {url("scan.pdf"): pdf_bytes([""])}
+        extract_pdf_texts(cache, embeds(url("scan.pdf")), FakeSource(files=files))
+        monkeypatch.setattr(pdf_text, "ocr_available", lambda: False)
+        again: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embeds(url("scan.pdf")), again, ocr=True)
+        assert again.fetched == []
+
+
+class TestCacheSchemaUpgrade:
+    def test_a_v1_cache_gains_the_ocr_columns_keeping_its_entries(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        connection: Final[sqlite3.Connection] = sqlite3.connect(cache)
+        with connection:
+            connection.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute(
+                "CREATE TABLE pdf_texts (url_key TEXT PRIMARY KEY, status TEXT NOT NULL,"
+                " extractor_version INTEGER NOT NULL, upload_name TEXT, byte_count INTEGER,"
+                " page_texts TEXT NOT NULL, error TEXT, extracted_at TEXT NOT NULL)"
+            )
+            connection.execute("INSERT INTO meta VALUES ('schema_version', '1')")
+            connection.execute(
+                "INSERT INTO pdf_texts VALUES (?, 'no-text', 1, 'scan.pdf', 10, '[\"\"]', NULL, '2026-11-13')",
+                (url_key(url("scan.pdf")),),
+            )
+        connection.close()
+        entry: Final[PdfText] = cached_pdf_texts(cache)[url_key(url("scan.pdf"))]
+        assert (entry.status, entry.ocr_version, entry.ocr_page_count) == (PdfStatus.NO_TEXT, 0, 0)
+        check: Final[sqlite3.Connection] = sqlite3.connect(cache)
+        assert check.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2"
+        check.close()

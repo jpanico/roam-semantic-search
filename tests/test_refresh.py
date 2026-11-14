@@ -229,3 +229,33 @@ class TestRefreshStorePdfBudget:
         summary: Final[RefreshSummary] = self._refresh(store, pdf_fetch_budget=PdfFetchBudget(max_pdfs=1))
         assert seen == [["blk000001"]]
         assert (summary.pdf_fetched_count, summary.pdf_pending_count) == (1, 4)
+
+
+class TestRefreshOcrSwitch:
+    def test_ocr_reaches_the_pdf_fetch_only_when_asked(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        received: Final[list[object]] = []
+
+        def extract_pdf_texts(*args: object, **kwargs: object) -> ExtractionSummary:
+            received.append(kwargs.get("ocr"))
+            return ExtractionSummary(distinct_count=0, current_count=0, outcomes={}, pending_count=0)
+
+        db_path: Final[Path] = tmp_path / "G.db"
+        meta: Final[StoreMeta] = StoreMeta(
+            graph_name="G", embed_model="m", dimension=3, built_at="2026-11-14T00:00:00+00:00", record_count=0
+        )
+        write_store(db_path, [], np.empty((0, 3), dtype=np.float32), meta)
+
+        def fetch_graph(endpoint: ApiEndpoint) -> list[dict[str, object]]:
+            return _ROWS
+
+        def embed_texts(texts: Sequence[str], model: str, base_url: str) -> list[list[float]]:
+            return [[1.0, 0.0, 0.0] for _ in texts]
+
+        monkeypatch.setattr(refresh, "fetch_graph", fetch_graph)
+        monkeypatch.setattr(refresh, "embed_texts", embed_texts)
+        monkeypatch.setattr(refresh, "extract_pdf_texts", extract_pdf_texts)
+        endpoint: Final[ApiEndpoint] = ApiEndpoint.from_parts(local_api_port=1, graph_name="G", bearer_token="unused")
+        cache: Final[Path] = tmp_path / "G.pdf-text.db"
+        refresh_store(db_path, endpoint, pdf_cache_path=cache, pdf_fetch_budget=PdfFetchBudget())
+        refresh_store(db_path, endpoint, pdf_cache_path=cache, pdf_fetch_budget=PdfFetchBudget(), ocr=True)
+        assert received == [False, True]

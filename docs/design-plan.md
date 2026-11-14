@@ -263,8 +263,8 @@ roam-semantic-search/
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
 - **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement), 5b
-  (extraction), and 5c (records and search) DONE 2026-11-13; 5d (budgets) DONE
-  2026-11-14.** Index the text inside attached PDFs — about 1,400 in
+  (extraction), and 5c (records and search) DONE 2026-11-13; 5d (budgets) and 5e (OCR)
+  DONE 2026-11-14.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
 
@@ -339,7 +339,8 @@ protection — Phase 5a's job.
   (`recovered_upload_name`), extractor version, extracted-at. Bumping the extractor
   version re-extracts.
 - **Extract.** pypdfium2 (Apache-2.0 / BSD-3), text layer only in the first cut.
-  PyMuPDF is ruled out: AGPL, against this repo's MIT.
+  PyMuPDF is ruled out: AGPL, against this repo's MIT. *5e* adds OCR of pages without a
+  text layer: macOS Vision through `pyobjc-framework-Vision` (MIT), on-device.
 - **Records.** One record per chunk: a PDF page, split past ~2,000 chars with a small
   overlap. Embed input: `breadcrumb › block text › PDF "<upload name>" p. N | <chunk>`.
   Chunk text does **not** fold into ancestors' `descendant_text` — it would swamp every
@@ -390,7 +391,9 @@ protection — Phase 5a's job.
   decrypted text of tax, medical, and estate documents at rest. It is the same class as
   the store, which already holds decrypted block text — and both stores are `0644`
   today. Create the text cache `0600`, and tighten the stores to match. *Done in 5b
-  (cache) and 5c (stores).*
+  (cache) and 5c (stores).* OCR (5e) keeps the posture: Vision runs on-device, a
+  separate framework whose network behaviour can be checked like Ollama's, and a page
+  reaches it as PNG bytes rendered in memory — no image is written to disk.
 - **Daily notes.** PDF chunks follow `--no-daily-notes` like their host blocks.
 
 ### Sub-phases
@@ -435,9 +438,27 @@ protection — Phase 5a's job.
   interactive budget took 3.2 s. Against scratch copies of the store and cache with 30
   PDFs removed, one refresh fetched 10 (8.3 MB) and reported 20 pending in 15.7 s; a
   second fetched 10 more and, under a 5-chunk embed cap, embedded 5 and deferred 19.
-- **5e — OCR, following 5c.** macOS Vision, on-device, for pages without a text layer;
-  an extractor-version bump re-extracts just those entries. 5a settled the "only if":
-  157 PDFs are fully scanned and unfindable without it.
+- **5e — OCR, following 5c: DONE 2026-11-14.** macOS Vision, on-device, for pages without
+  a text layer; an extractor-version bump re-extracts just those entries. 5a settled the
+  "only if": 157 PDFs are fully scanned and unfindable without it. *As built:* not an
+  extractor-version bump, which would have refetched every PDF, but an OCR version of
+  its own. The cache (schema v2, migrated in place) records which `OCR_VERSION` read
+  each PDF's blank pages, and a run with OCR on refetches exactly the cached PDFs that
+  still have blank pages no current OCR has read — a page OCR could not read either
+  stays blank, and its PDF does not come back. A page renders at 216 dpi (longest side
+  capped at 4,000 px), goes to Vision's accurate recognizer as in-memory PNG bytes, and
+  its lines are ordered top to bottom, then left to right. OCR is opt-in per run because
+  it costs about a second a page: the CLI's `build`, `refresh`, and `extract-pdfs` do it
+  by default (`--ocr/--no-ocr`), and the MCP server's refreshes never do. Tests cover it
+  on a committed image-only fixture (`tests/fixtures/scanned.pdf`, made with `sips`).
+  Live on hippo, two `extract-pdfs` runs under the 500 MB default read all 246 PDFs with
+  blank pages: 145 (506 MB, 442 pages by OCR, 487 s), then the last 101 (370 MB, 548
+  pages, 543 s). Every one now has text — no `no-text` PDF remains — and 990 of the
+  1,140 blank pages were readable; Roam Desktop stayed up through the 876 MB. One
+  `refresh` then embedded the 1,466 new passages in 91 s (27,079 records). Paraphrased
+  queries found a scanned church giving letter, two scanned wills, and a scanned
+  immunization form first. A PDF embedded in two blocks surfaces once per block — by
+  design, since each block is its own citation.
 
 ### Phase 5a results (2026-11-13, live hippo)
 

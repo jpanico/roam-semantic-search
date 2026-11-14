@@ -177,4 +177,5 @@ class TestInteractivePdfBudget:
         outcome: Final[AutoRefresh] = mcp_server._ensured_fresh("hippo", Path("ignored.db"))
         assert received["pdf_fetch_budget"] == INTERACTIVE_PDF_FETCH_BUDGET
         assert received["max_pdf_embeds"] == INTERACTIVE_MAX_PDF_EMBEDS
+        assert not received.get("ocr", False)  # OCR is a second a page: never in a call someone waits on
         assert outcome.summary == leftover

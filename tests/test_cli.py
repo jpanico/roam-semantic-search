@@ -165,6 +165,9 @@ class TestPdfBudgetOptions:
         assert result.exit_code == 0
         assert received["pdf_fetch_budget"] == PdfFetchBudget(max_bytes=500_000_000)
         assert received["max_pdf_embeds"] == 7
+        assert received["ocr"] is True
+        runner.invoke(cli.app, ["refresh", "--graph", "SCFH", "--db", str(store), "--no-ocr"])
+        assert received["ocr"] is False
         assert "PDFs: 0 fetched" in result.output
 
     def test_extract_pdfs_takes_count_and_byte_bounds(

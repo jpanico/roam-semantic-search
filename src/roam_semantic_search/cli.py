@@ -97,6 +97,13 @@ MaxPdfMbOption = Annotated[
         help="Stop fetching PDFs once this many MB have crossed Roam Desktop (a large run once crashed it)",
     ),
 ]
+OcrOption = Annotated[
+    bool,
+    typer.Option(
+        "--ocr/--no-ocr",
+        help="Read scanned PDF pages by on-device OCR (macOS Vision; about a second a page)",
+    ),
+]
 DEFAULT_MAX_PDF_MB: Final[float] = 500.0
 """A CLI run's default PDF byte budget: well under the ~1.3 GB after which a run crashed Roam Desktop."""
 RequireOpenWindowOption = Annotated[
@@ -150,11 +157,13 @@ def _outcomes(summary: ExtractionSummary) -> str:
 
 
 def _fetch_pdfs(
-    cache_path: Path, embeds: Sequence[PdfEmbed], api_endpoint: ApiEndpoint, budget: PdfFetchBudget
+    cache_path: Path, embeds: Sequence[PdfEmbed], api_endpoint: ApiEndpoint, budget: PdfFetchBudget, ocr: bool
 ) -> ExtractionSummary | None:
     """Fetch what the cache lacks within *budget*, reporting a failure rather than raising it."""
     try:
-        return extract_pdf_texts(cache_path, embeds, LocalApiGraphSource(api_endpoint=api_endpoint), budget=budget)
+        return extract_pdf_texts(
+            cache_path, embeds, LocalApiGraphSource(api_endpoint=api_endpoint), budget=budget, ocr=ocr
+        )
     except (RuntimeError, requests.exceptions.RequestException) as error:
         typer.echo(f"fetching PDFs failed; indexing the cached PDF text only: {error}", err=True)
         return None
@@ -226,6 +235,7 @@ def build(
     pdf_cache_path: PdfCacheOption = None,
     max_pdfs: MaxPdfsOption = None,
     max_pdf_mb: MaxPdfMbOption = DEFAULT_MAX_PDF_MB,
+    ocr: OcrOption = True,
 ) -> None:
     """Fetch the graph, normalize, embed locally, and (re)write the index store.
 
@@ -245,11 +255,12 @@ def build(
             indexable_pdf_embeds(rows, include_daily_notes=include_daily_notes),
             api_endpoint,
             _fetch_budget(max_pdfs, max_pdf_mb),
+            ocr,
         )
         if extraction is not None:
             typer.echo(
-                f"PDFs: fetched {extraction.extracted_count} ({_outcomes(extraction)}),"
-                f" {extraction.pending_count} pending"
+                f"PDFs: fetched {extraction.extracted_count} ({_outcomes(extraction)};"
+                f" {extraction.ocr_page_count} pages by OCR), {extraction.pending_count} pending"
             )
         records.extend(pdf_chunk_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
     pdf_count: Final[int] = sum(1 for record in records if record.kind is RecordKind.PDF)
@@ -311,6 +322,7 @@ def refresh(
     max_pdf_embeds: Annotated[
         int | None, typer.Option("--max-pdf-embeds", min=0, help="Embed at most this many PDF passages")
     ] = None,
+    ocr: OcrOption = True,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
     """Incrementally update the store: re-embed only changed records, delete vanished ones.
@@ -343,6 +355,7 @@ def refresh(
         pdf_cache_path=_pdf_cache_path(graph, pdf_cache_path),
         pdf_fetch_budget=_fetch_budget(max_pdfs, max_pdf_mb),
         max_pdf_embeds=max_pdf_embeds,
+        ocr=ocr,
     )
     elapsed: Final[float] = time.perf_counter() - started
     typer.echo(
@@ -370,6 +383,7 @@ def extract_pdfs(
     ] = False,
     max_pdfs: MaxPdfsOption = None,
     max_pdf_mb: MaxPdfMbOption = DEFAULT_MAX_PDF_MB,
+    ocr: OcrOption = True,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
     """Fetch the graph's attached PDFs and cache their text, for indexing.
@@ -393,6 +407,7 @@ def extract_pdfs(
             LocalApiGraphSource(api_endpoint=api_endpoint),
             retry_failed=retry_failed,
             budget=_fetch_budget(max_pdfs, max_pdf_mb),
+            ocr=ocr,
         )
     except RuntimeError as error:
         typer.echo(f"aborted: {error}", err=True)
@@ -401,7 +416,8 @@ def extract_pdfs(
     typer.echo(
         f"{resolved_cache}: {summary.distinct_count} distinct PDFs in {len(embeds)} embeds;"
         f" extracted {summary.extracted_count} ({summary.fetched_bytes / 1_000_000:.0f} MB) in {elapsed:.1f}s"
-        f" ({_outcomes(summary)}); {summary.current_count} already current, {summary.pending_count} pending"
+        f" ({_outcomes(summary)}; {summary.ocr_page_count} pages by OCR); {summary.current_count} already current,"
+        f" {summary.pending_count} pending"
     )
 
 

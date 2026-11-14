@@ -66,6 +66,9 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
   (`brew services start ollama` keeps it running at login)
 - **Python ≥ 3.14** and a sibling checkout of
   [guffin](https://github.com/jpanico/guffin) (the Local API transport layer)
+- **macOS**, for OCR of scanned PDFs only: Apple's on-device Vision framework, reached
+  through `pyobjc-framework-Vision` (installed with the package on macOS). Elsewhere PDFs
+  are indexed from their text layers alone.
 
 ## Install
 
@@ -154,11 +157,17 @@ entries are keyed by a digest of the URL rather than the URL (which embeds an ac
 A run skips every PDF already cached, so it resumes where the last one stopped.
 `--max-pdfs N` and `--max-pdf-mb N` bound one run's fetching (default 500 MB) on all three
 commands; `refresh --max-pdf-embeds N` also caps how many PDF passages it embeds, leaving
-the rest for the next refresh (page and block edits are never held back). Each PDF lands as `ok`, `no-text` (a scan, awaiting OCR), `password`,
+the rest for the next refresh (page and block edits are never held back). Each PDF lands as `ok`, `no-text` (a scan OCR could not read, or that no OCR run has seen), `password`,
 `parse-failed`, or `fetch-failed`. A password-protected PDF is never refetched — an upload
 never changes — while `--retry-failed` refetches the two failure kinds. Five fetch failures
 in a row abort the run without caching them: at that point the graph, not its files, is
 failing. Like `refresh`, it takes `--require-open-window`.
+
+**Scanned pages are read by OCR.** A page with no text layer is rendered in memory and
+read by macOS Vision, on-device — nothing leaves the machine, and no image is written to
+disk. It costs about a second a page, so it is a CLI matter: `build`, `refresh`, and
+`extract-pdfs` OCR by default (`--no-ocr` to skip), refetching cached PDFs whose blank pages
+no OCR has read yet, while the MCP server's refreshes never OCR.
 
 **Why the byte budget.** Every PDF passes through Roam Desktop as one base64 string, and on
 2026-11-13 an unbudgeted first run crashed Roam Desktop after ~1.3 GB (about 1,250 PDFs).

@@ -7,6 +7,11 @@ asset decrypted), held in memory only, its text layer extracted page by page wit
 and the result cached by URL.  A Firebase Storage URL names one immutable upload, so a cached
 entry never goes stale; only a newer extractor (:data:`EXTRACTOR_VERSION`) re-extracts it.
 
+A page without a text layer — a scan — can be read by on-device OCR
+(:mod:`roam_semantic_search.ocr`).  OCR is opt-in per run, since it costs about a second a
+page: a run with ``ocr=True`` fills such pages, and a cached PDF with blank pages that no
+current OCR has read (:data:`~roam_semantic_search.ocr.OCR_VERSION`) is fetched again for it.
+
 The cache is its own SQLite file beside the index store, because ``build`` deletes and
 recreates the store and a rebuild must not refetch every PDF.  It holds decrypted text, so it
 is kept owner-only (``0600``).  No PDF bytes are ever written to disk, and the cache keys
@@ -17,6 +22,7 @@ Public symbols:
 - :class:`PdfEmbed` — one PDF embed: the hosting block's uid and the PDF's storage URL.
 - :class:`PdfStatus` — the outcome of one PDF's extraction.
 - :class:`PdfText` — one cached extraction result.
+- :class:`ExtractedText` — what extracting one PDF found: status, page texts, OCR'd pages.
 - :class:`PdfFetchBudget` — how much one run may fetch: PDFs, bytes, seconds.
 - :class:`ExtractionSummary` — what an extraction run did, by count.
 - :data:`EXTRACTOR_VERSION` — the extraction logic's version; a bump re-extracts.
@@ -44,7 +50,7 @@ from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 import pypdfium2
 import pypdfium2.raw as pdfium_raw
@@ -54,6 +60,8 @@ from guffin.roam.asset import RoamAsset
 from guffin.roam.graph_source import GraphSource
 from guffin.roam.markdown import PDF_EMBED_RE
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, validate_call
+
+from roam_semantic_search.ocr import OCR_VERSION, ocr_available, recognized_page_text
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +74,7 @@ NO_TEXT_PAGE_MIN_CHARS: Final[int] = 20
 CONSECUTIVE_FETCH_FAILURE_LIMIT: Final[int] = 5
 """Failed fetches in a row that abort a run: the graph itself, not the files, is failing."""
 
-_CACHE_SCHEMA_VERSION: Final[int] = 1
+_CACHE_SCHEMA_VERSION: Final[int] = 2
 _CACHE_FILE_MODE: Final[int] = 0o600
 _PROGRESS_INTERVAL: Final[int] = 25
 _ERROR_MAX_CHARS: Final[int] = 300
@@ -83,9 +91,17 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         byte_count INTEGER,
         page_texts TEXT NOT NULL,
         error TEXT,
-        extracted_at TEXT NOT NULL
+        extracted_at TEXT NOT NULL,
+        ocr_version INTEGER NOT NULL DEFAULT 0,
+        ocr_page_count INTEGER NOT NULL DEFAULT 0
     )
     """,
+)
+
+_V1_TO_V2_STATEMENTS: Final[tuple[str, ...]] = (
+    "ALTER TABLE pdf_texts ADD COLUMN ocr_version INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE pdf_texts ADD COLUMN ocr_page_count INTEGER NOT NULL DEFAULT 0",
+    "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
 )
 
 
@@ -134,6 +150,9 @@ class PdfText(BaseModel):
             failure, and ``""`` for a page without a text layer.
         error: The failure's description, for a failed status.
         extracted_at: ISO-8601 moment of the extraction.
+        ocr_version: The :data:`~roam_semantic_search.ocr.OCR_VERSION` that read the PDF's
+            blank pages, or ``0`` when no OCR has.
+        ocr_page_count: How many of ``page_texts`` came from OCR.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -145,6 +164,24 @@ class PdfText(BaseModel):
     page_texts: tuple[str, ...] = ()
     error: str | None = None
     extracted_at: str
+    ocr_version: int = 0
+    ocr_page_count: int = 0
+
+
+class ExtractedText(NamedTuple):
+    """What extracting one PDF found.
+
+    Attributes:
+        status: The extraction's outcome.
+        page_texts: One cleaned text per page; ``""`` for a page with no readable text.
+        error: The failure's description, for a failed status.
+        ocr_page_count: How many pages' text came from OCR.
+    """
+
+    status: PdfStatus
+    page_texts: tuple[str, ...]
+    error: str | None
+    ocr_page_count: int = 0
 
 
 class PdfFetchBudget(BaseModel):
@@ -184,6 +221,7 @@ class ExtractionSummary(BaseModel):
         current_count: PDFs whose cached entry needed no work this run.
         outcomes: This run's extractions by resulting status.
         fetched_bytes: Decrypted bytes this run fetched.
+        ocr_page_count: Pages this run read by OCR.
         pending_count: PDFs still needing extraction after the run (the budget held them back).
     """
 
@@ -193,6 +231,7 @@ class ExtractionSummary(BaseModel):
     current_count: int
     outcomes: dict[PdfStatus, int]
     fetched_bytes: int = 0
+    ocr_page_count: int = 0
     pending_count: int
 
     @property
@@ -253,17 +292,23 @@ def _clean_page_text(raw_text: str) -> str:
     return " ".join(_CONTROL_CHAR_RE.sub(" ", raw_text).split())
 
 
+def _readable(text: str) -> str:
+    """*text* when it has at least :data:`NO_TEXT_PAGE_MIN_CHARS` non-whitespace chars, else ``""``."""
+    return text if len(text.replace(" ", "")) >= NO_TEXT_PAGE_MIN_CHARS else ""
+
+
 @validate_call
-def extracted_text(contents: bytes) -> tuple[PdfStatus, tuple[str, ...], str | None]:
-    """Extract a PDF's text layer, page by page.
+def extracted_text(contents: bytes, ocr: bool = False) -> ExtractedText:
+    """Extract a PDF's text, page by page: its text layer, and with *ocr* its scanned pages.
 
     Args:
         contents: The PDF's (decrypted) bytes.
+        ocr: Whether to OCR the pages without a usable text layer (on-device, when available).
 
     Returns:
         The status, one cleaned text per page (``""`` for a page with fewer than
-        :data:`NO_TEXT_PAGE_MIN_CHARS` non-whitespace chars), and an error description
-        for a failed status.
+        :data:`NO_TEXT_PAGE_MIN_CHARS` non-whitespace chars, after OCR when asked), an error
+        description for a failed status, and how many pages OCR filled.
     """
     try:
         document: Final[pypdfium2.PdfDocument] = pypdfium2.PdfDocument(contents)
@@ -271,21 +316,26 @@ def extracted_text(contents: bytes) -> tuple[PdfStatus, tuple[str, ...], str | N
         status: PdfStatus = (
             PdfStatus.PASSWORD if error.err_code == pdfium_raw.FPDF_ERR_PASSWORD else PdfStatus.PARSE_FAILED
         )
-        return status, (), str(error)[:_ERROR_MAX_CHARS]
+        return ExtractedText(status, (), str(error)[:_ERROR_MAX_CHARS])
     page_texts: Final[list[str]] = []
+    ocr_page_count: int = 0
     try:
         for page_index in range(len(document)):
             page: pypdfium2.PdfPage = document[page_index]
             textpage: pypdfium2.PdfTextPage = page.get_textpage()
-            text: str = _clean_page_text(textpage.get_text_bounded())
+            text: str = _readable(_clean_page_text(textpage.get_text_bounded()))
             textpage.close()
+            if not text and ocr:
+                text = _readable(_clean_page_text(recognized_page_text(page)))
+                ocr_page_count += 1 if text else 0
             page.close()
-            page_texts.append(text if len(text.replace(" ", "")) >= NO_TEXT_PAGE_MIN_CHARS else "")
+            page_texts.append(text)
     except pypdfium2.PdfiumError as error:
-        return PdfStatus.PARSE_FAILED, (), str(error)[:_ERROR_MAX_CHARS]
+        return ExtractedText(PdfStatus.PARSE_FAILED, (), str(error)[:_ERROR_MAX_CHARS])
     finally:
         document.close()
-    return (PdfStatus.OK if any(page_texts) else PdfStatus.NO_TEXT), tuple(page_texts), None
+    status_found: Final[PdfStatus] = PdfStatus.OK if any(page_texts) else PdfStatus.NO_TEXT
+    return ExtractedText(status_found, tuple(page_texts), None, ocr_page_count)
 
 
 def _connected_cache(cache_path: Path) -> sqlite3.Connection:
@@ -300,6 +350,9 @@ def _connected_cache(cache_path: Path) -> sqlite3.Connection:
         connection.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)", (str(_CACHE_SCHEMA_VERSION),)
         )
+        if connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1":
+            for statement in _V1_TO_V2_STATEMENTS:  # v2 only adds the OCR columns; every entry is kept
+                connection.execute(statement)
     stored_version: Final[str] = connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
     if stored_version != str(_CACHE_SCHEMA_VERSION):
         connection.close()
@@ -312,10 +365,10 @@ def _connected_cache(cache_path: Path) -> sqlite3.Connection:
 
 def _read_entries(connection: sqlite3.Connection) -> dict[str, PdfText]:
     """Every cached entry by URL key."""
-    rows: Final[list[tuple[str, str, int, str | None, int | None, str, str | None, str]]] = list(
+    rows: Final[list[tuple[str, str, int, str | None, int | None, str, str | None, str, int, int]]] = list(
         connection.execute(
-            "SELECT url_key, status, extractor_version, upload_name, byte_count, page_texts, error, extracted_at"
-            " FROM pdf_texts"
+            "SELECT url_key, status, extractor_version, upload_name, byte_count, page_texts, error, extracted_at,"
+            " ocr_version, ocr_page_count FROM pdf_texts"
         )
     )
     return {
@@ -327,8 +380,21 @@ def _read_entries(connection: sqlite3.Connection) -> dict[str, PdfText]:
             page_texts=tuple(json.loads(page_texts)),
             error=error,
             extracted_at=extracted_at,
+            ocr_version=ocr_version,
+            ocr_page_count=ocr_page_count,
         )
-        for key, status, extractor_version, upload_name, byte_count, page_texts, error, extracted_at in rows
+        for (
+            key,
+            status,
+            extractor_version,
+            upload_name,
+            byte_count,
+            page_texts,
+            error,
+            extracted_at,
+            ocr_version,
+            ocr_page_count,
+        ) in rows
     }
 
 
@@ -336,7 +402,7 @@ def _write_entry(connection: sqlite3.Connection, key: str, entry: PdfText) -> No
     """Insert or replace one cached entry, committed at once so an interrupted run keeps it."""
     with connection:
         connection.execute(
-            "INSERT OR REPLACE INTO pdf_texts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO pdf_texts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 entry.status.value,
@@ -346,6 +412,8 @@ def _write_entry(connection: sqlite3.Connection, key: str, entry: PdfText) -> No
                 json.dumps(list(entry.page_texts)),
                 entry.error,
                 entry.extracted_at,
+                entry.ocr_version,
+                entry.ocr_page_count,
             ),
         )
 
@@ -369,11 +437,17 @@ def cached_pdf_texts(cache_path: Path) -> dict[str, PdfText]:
         connection.close()
 
 
-def _needs_extraction(entry: PdfText | None, retry_failed: bool) -> bool:
+def _needs_ocr(entry: PdfText) -> bool:
+    """Whether a cached PDF has blank pages that no current OCR has read."""
+    return "" in entry.page_texts and entry.ocr_version < OCR_VERSION
+
+
+def _needs_extraction(entry: PdfText | None, retry_failed: bool, ocr: bool) -> bool:
     """Whether a URL's cached entry (or its absence) calls for a fetch this run.
 
-    An upload never changes, so only a missing entry, a newer extractor, or an explicit
-    retry of a failure brings a URL back; a password-protected PDF never comes back.
+    An upload never changes, so only a missing entry, a newer extractor, an explicit retry
+    of a failure, or — in a run that OCRs — blank pages no current OCR has read bring a URL
+    back; a password-protected PDF never comes back.
     """
     if entry is None:
         return True
@@ -385,7 +459,7 @@ def _needs_extraction(entry: PdfText | None, retry_failed: bool) -> bool:
         case PdfStatus.PARSE_FAILED:
             return retry_failed or entry.extractor_version < EXTRACTOR_VERSION
         case PdfStatus.OK | PdfStatus.NO_TEXT:
-            return entry.extractor_version < EXTRACTOR_VERSION
+            return entry.extractor_version < EXTRACTOR_VERSION or (ocr and _needs_ocr(entry))
 
 
 def _now() -> str:
@@ -393,7 +467,7 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _fetched_entry(source: GraphSource, url: str) -> PdfText:
+def _fetched_entry(source: GraphSource, url: str, ocr: bool) -> PdfText:
     """Fetch one PDF into memory, extract it, and return its cache entry (bytes discarded).
 
     A Local API error answering for this file (an HTTP error status, or a malformed
@@ -409,15 +483,17 @@ def _fetched_entry(source: GraphSource, url: str) -> PdfText:
             error=f"{type(error).__name__}: {error}"[:_ERROR_MAX_CHARS],
             extracted_at=_now(),
         )
-    status, page_texts, error_text = extracted_text(asset.contents)
+    extraction: Final[ExtractedText] = extracted_text(asset.contents, ocr=ocr)
     return PdfText(
-        status=status,
+        status=extraction.status,
         extractor_version=EXTRACTOR_VERSION,
         upload_name=asset.original_file_name,
         byte_count=len(asset.contents),
-        page_texts=page_texts,
-        error=error_text,
+        page_texts=extraction.page_texts,
+        error=extraction.error,
         extracted_at=_now(),
+        ocr_version=OCR_VERSION if ocr else 0,
+        ocr_page_count=extraction.ocr_page_count,
     )
 
 
@@ -428,6 +504,7 @@ def extract_pdf_texts(
     source: GraphSource,
     retry_failed: bool = False,
     budget: PdfFetchBudget | None = None,
+    ocr: bool = False,
 ) -> ExtractionSummary:
     """Fetch and extract every embedded PDF the cache lacks, caching each result as it lands.
 
@@ -447,6 +524,9 @@ def extract_pdf_texts(
         source: The graph source the PDFs are fetched from.
         retry_failed: Whether to refetch PDFs whose fetch or parse failed before.
         budget: How much the run may fetch; ``None`` fetches everything that needs it.
+        ocr: Whether to OCR pages without a text layer — and so to refetch cached PDFs whose
+            blank pages no current OCR has read.  Ignored (with a warning) where on-device
+            OCR is unavailable.
 
     Returns:
         The run's summary.
@@ -456,13 +536,19 @@ def extract_pdf_texts(
     """
     urls: Final[list[str]] = list(dict.fromkeys(embed.url for embed in embeds))
     bounds: Final[PdfFetchBudget] = budget if budget is not None else PdfFetchBudget()
+    run_ocr: Final[bool] = ocr and ocr_available()
+    if ocr and not run_ocr:
+        logger.warning("on-device OCR is unavailable here (macOS Vision via pyobjc); extracting text layers only")
+    ocr_pages: int = 0
     connection: Final[sqlite3.Connection] = _connected_cache(cache_path)
     started: Final[float] = time.monotonic()
     fetched: int = 0
     fetched_bytes: int = 0
     try:
         cached: Final[dict[str, PdfText]] = _read_entries(connection)
-        due: Final[list[str]] = [url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed)]
+        due: Final[list[str]] = [
+            url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed, run_ocr)
+        ]
         logger.info("%d distinct PDFs; %d need extraction", len(urls), len(due))
         outcomes: Final[Counter[PdfStatus]] = Counter()
         failure_run: Final[list[tuple[str, PdfText]]] = []
@@ -470,9 +556,10 @@ def extract_pdf_texts(
             if bounds.exhausted(fetched, fetched_bytes, time.monotonic() - started):
                 logger.info("fetch budget reached after %d PDFs (%d bytes)", fetched, fetched_bytes)
                 break
-            entry: PdfText = _fetched_entry(source, url)
+            entry: PdfText = _fetched_entry(source, url, run_ocr)
             fetched += 1
             fetched_bytes += entry.byte_count or 0
+            ocr_pages += entry.ocr_page_count
             if entry.status is PdfStatus.FETCH_FAILED:
                 failure_run.append((url, entry))
                 if len(failure_run) >= CONSECUTIVE_FETCH_FAILURE_LIMIT:
@@ -499,5 +586,6 @@ def extract_pdf_texts(
         current_count=len(urls) - len(due),
         outcomes=dict(outcomes),
         fetched_bytes=fetched_bytes,
+        ocr_page_count=ocr_pages,
         pending_count=len(due) - fetched,
     )

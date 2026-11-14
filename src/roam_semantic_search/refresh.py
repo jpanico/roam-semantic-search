@@ -10,7 +10,9 @@ Attached PDFs are budgeted twice over, so an interactive refresh stays quick how
 a backlog is.  Given a :class:`~roam_semantic_search.pdf_text.PdfFetchBudget`, a refresh
 first fetches the PDFs its PDF text cache lacks, up to that budget; and given
 ``max_pdf_embeds``, it embeds at most that many PDF chunk records, deferring the rest to
-the next refresh.  Page and block records are never deferred: an edit always lands.  A
+the next refresh.  Page and block records are never deferred: an edit always lands.
+OCR of scanned pages is off unless asked for (``ocr=True``), since it costs about a second
+a page; the interactive budget never asks.  A
 failure while fetching PDFs never fails the refresh — it is reported, and the refresh
 proceeds on what the cache already holds.  Hash diffing is the sole
 selector — no timestamp heuristics — because a record's embeddable input can change
@@ -189,6 +191,7 @@ def refresh_store(
     pdf_cache_path: Path | None = None,
     pdf_fetch_budget: PdfFetchBudget | None = None,
     max_pdf_embeds: int | None = None,
+    ocr: bool = False,
 ) -> RefreshSummary:
     """Plan and apply an incremental refresh against a store.
 
@@ -213,6 +216,8 @@ def refresh_store(
             no PDFs.
         max_pdf_embeds: The most PDF chunk records to embed (:func:`budgeted_embeds`);
             ``None`` for no cap.
+        ocr: Whether the PDF fetch OCRs scanned pages (on-device, about a second a page),
+            refetching cached PDFs whose blank pages no current OCR has read.
 
     Returns:
         The refresh summary.
@@ -241,6 +246,7 @@ def refresh_store(
                     indexable_pdf_embeds(rows, include_daily_notes=include_daily_notes),
                     LocalApiGraphSource(api_endpoint=api_endpoint),
                     budget=pdf_fetch_budget,
+                    ocr=ocr,
                 )
             except (RuntimeError, requests.exceptions.RequestException) as error:
                 logger.warning("fetching PDFs failed; refreshing from the cached PDF text: %s", error)
