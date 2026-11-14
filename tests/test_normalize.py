@@ -2,7 +2,18 @@
 
 from typing import Final
 
-from roam_semantic_search.normalize import IndexRecord, _page_ref_names, _plain_text, normalized_records
+from roam_semantic_search.normalize import (
+    PDF_CHUNK_MAX_CHARS,
+    PDF_CHUNK_OVERLAP_CHARS,
+    IndexRecord,
+    RecordKind,
+    _chunked,
+    _page_ref_names,
+    _plain_text,
+    normalized_records,
+    pdf_chunk_records,
+)
+from roam_semantic_search.pdf_text import PdfStatus, PdfText, url_key
 
 
 class TestPlainText:
@@ -233,3 +244,94 @@ class TestRetrievalEmphasis:
         parent: Final[IndexRecord] = next(record for record in records if record.uid == "block0001")
         assert len(parent.embed_input) == 8000
         assert "concepts: Emi" in parent.embed_input
+
+
+_PDF_URL: Final[str] = (
+    "https://firebasestorage.googleapis.com/v0/b/test.appspot.com/o/imgs%2Fapp%2Ftest%2FAb3dE.pdf.enc"
+    "?alt=media&token=abc123"
+)
+
+
+def _words(count: int) -> str:
+    return " ".join(f"w{index:05d}" for index in range(count))
+
+
+def _pdf_text(*page_texts: str, status: PdfStatus = PdfStatus.OK) -> PdfText:
+    return PdfText(
+        status=status,
+        extractor_version=1,
+        upload_name="shed.pdf",
+        page_texts=page_texts,
+        extracted_at="2026-11-13T00:00:00+00:00",
+    )
+
+
+class TestChunked:
+    def test_short_text_is_one_chunk(self) -> None:
+        assert _chunked("a short page") == ["a short page"]
+
+    def test_long_text_splits_at_words_with_overlap(self) -> None:
+        text: Final[str] = _words(1000)  # 6,999 chars
+        chunks: Final[list[str]] = _chunked(text)
+        words: Final[set[str]] = set(text.split())
+        assert len(chunks) > 1
+        for chunk in chunks:
+            assert len(chunk) <= PDF_CHUNK_MAX_CHARS
+            assert set(chunk.split()) <= words  # never cut inside a word
+        for previous, following in zip(chunks, chunks[1:], strict=False):
+            assert following.split()[0] in previous.split()  # consecutive chunks share text
+            assert len(set(previous.split()) & set(following.split())) * 7 <= PDF_CHUNK_OVERLAP_CHARS + 7
+        assert set(" ".join(chunks).split()) == words  # nothing lost
+
+    def test_spaceless_run_is_cut_at_the_cap(self) -> None:
+        chunks: Final[list[str]] = _chunked("x" * (PDF_CHUNK_MAX_CHARS * 2 + 10))
+        assert len(chunks[0]) == PDF_CHUNK_MAX_CHARS
+        assert "".join(chunks).count("x") >= PDF_CHUNK_MAX_CHARS * 2 + 10
+
+
+class TestPdfChunkRecords:
+    def _rows(self, string: str, page_uid: str = "page00001") -> list[dict[str, object]]:
+        return [_page_row(1, page_uid, "Garden"), _block_row(2, "blk000001", string, 1, [1])]
+
+    def test_one_record_per_chunk_of_each_text_page(self) -> None:
+        long_page: Final[str] = _words(600)
+        records: Final[list[IndexRecord]] = pdf_chunk_records(
+            self._rows(f"manual: {{{{pdf: {_PDF_URL}}}}}"),
+            {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed", "", long_page)},
+        )
+        assert {record.uid for record in records} == {"blk000001"}
+        assert {record.kind for record in records} == {RecordKind.PDF}
+        assert [(record.pdf.page, record.pdf.chunk) for record in records if record.pdf] == [
+            (1, 1),
+            *((3, chunk) for chunk in range(1, len(_chunked(long_page)) + 1)),
+        ]
+        assert len({record.record_id for record in records}) == len(records)
+        first: Final[IndexRecord] = records[0]
+        assert first.record_id == f"blk000001/pdf/{url_key(_PDF_URL)[:8]}/1.1"
+        assert first.breadcrumb == 'Garden › manual: › PDF "shed.pdf"'
+        assert first.text == "Invoice for the garden shed"
+        assert first.embed_input == 'Garden › manual: › PDF "shed.pdf" p. 1 › Invoice for the garden shed'
+        assert first.descendant_text == ""
+
+    def test_pdf_without_usable_text_yields_nothing(self) -> None:
+        rows: Final[list[dict[str, object]]] = self._rows(f"{{{{[[pdf]]: {_PDF_URL}}}}}")
+        assert pdf_chunk_records(rows, {}) == []
+        assert pdf_chunk_records(rows, {"another-key": _pdf_text("text")}) == []
+        assert pdf_chunk_records(rows, {url_key(_PDF_URL): _pdf_text("", "", status=PdfStatus.NO_TEXT)}) == []
+
+    def test_a_pdf_embedded_twice_in_one_block_is_chunked_once(self) -> None:
+        records: Final[list[IndexRecord]] = pdf_chunk_records(
+            self._rows(f"{{{{pdf: {_PDF_URL}}}}} again {{{{pdf: {_PDF_URL}}}}}"),
+            {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed")},
+        )
+        assert len(records) == 1
+
+    def test_daily_note_pdfs_follow_the_daily_notes_switch(self) -> None:
+        rows: Final[list[dict[str, object]]] = self._rows(f"{{{{pdf: {_PDF_URL}}}}}", page_uid="11-13-2026")
+        texts: Final[dict[str, PdfText]] = {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed")}
+        assert len(pdf_chunk_records(rows, texts)) == 1
+        assert pdf_chunk_records(rows, texts, include_daily_notes=False) == []
+
+    def test_block_records_are_unaffected_by_pdfs(self) -> None:
+        rows: Final[list[dict[str, object]]] = self._rows(f"{{{{pdf: {_PDF_URL}}}}}")
+        assert [record.uid for record in normalized_records(rows)] == ["page00001"]  # the bare embed has no text

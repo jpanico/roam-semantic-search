@@ -36,15 +36,22 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
   words plus its whole subtree's folded text (base). The keyword leg realizes the
   tiers as per-column BM25 weights (4/2/1); the vector leg by embed-input
   composition (labeled concept/tag segments, descendant text truncated first).
+- **Attached PDFs** — each page of an attached PDF with a text layer becomes one or
+  more chunk records (~2,000 chars, overlapping), set in the context of the block
+  that embeds the PDF and carrying that block's uid. The text comes from a local
+  cache that `extract-pdfs` fills; indexing never fetches a PDF itself.
 - **Embed** — a local [Ollama](https://ollama.com) server running
   `nomic-embed-text` (768-dim), with the model's `search_document:` /
   `search_query:` retrieval prefixes. Loopback-only, enforced.
-- **Store** — one SQLite file (default `~/.cache/roam-semantic-search/<graph>.db`):
-  records + float32 embedding blobs, an FTS5 keyword mirror, and provenance meta.
+- **Store** — one SQLite file (default `~/.cache/roam-semantic-search/<graph>.db`),
+  owner-only since it holds the graph's decrypted text: records + float32 embedding
+  blobs, an FTS5 keyword mirror, and provenance meta.
   No SQLite extensions; vector KNN is a brute-force numpy matrix product
   (milliseconds at this scale).
 - **Query** — hybrid retrieval: cosine KNN and BM25 rankings fused by reciprocal
   rank fusion, so paraphrase ("where do I argue…") and exact identifiers both rank.
+  Hits collapse to the best-matching passage of each PDF, so one long PDF cannot
+  fill the results.
 - **Refresh** — incremental: re-fetch + re-normalize everything (cheap), then
   re-embed only records whose content hash changed and delete vanished uids.
   Selection is by content hash alone — an edit changes descendants' breadcrumbs
@@ -134,11 +141,12 @@ does not know about.
 
 ### PDF attachments: `extract-pdfs`
 
-The index does not yet search inside attached PDFs (that is Phase 5c of
-`docs/design-plan.md`); `extract-pdfs` is the step that makes it possible. It fetches every
+Searching inside attached PDFs takes two steps: `extract-pdfs` caches their text, and
+the next `build` or `refresh` indexes it (`--no-pdfs` leaves PDFs out). It fetches every
 PDF a block embeds (`{{pdf: …}}` / `{{[[pdf]]: …}}`) through the Local API — decrypted, for
 an encrypted graph — holds it in memory only, and caches its text layer page by page in
-`~/.cache/roam-semantic-search/<graph>.pdf-text.db` (`--cache` overrides). That file holds
+`~/.cache/roam-semantic-search/<graph>.pdf-text.db` (`--pdf-cache` overrides, on all three
+commands). That file holds
 decrypted text, so it is created owner-only (`0600`); no PDF bytes are written to disk, and
 entries are keyed by a digest of the URL rather than the URL (which embeds an access token).
 
@@ -153,6 +161,10 @@ failing. Like `refresh`, it takes `--require-open-window`.
 string, and on 2026-11-13 an unbatched first run crashed Roam Desktop after ~1.3 GB (about
 1,250 PDFs). Until that is understood, prefer `--limit 200` runs; each one resumes where
 the last stopped.
+
+**Embed a large batch from the CLI.** After an `extract-pdfs` run that adds many PDFs,
+run `refresh` yourself: otherwise the MCP server's next pre-search auto-refresh embeds
+every new chunk before answering (hippo's ~10,400 chunks take ~10 minutes).
 
 ### Unattended refreshes: `--require-open-window`
 
@@ -202,6 +214,9 @@ position (`v:` vector, `k:` keyword), the breadcrumb, and the text:
     The human also remains the accountability boundary. The assistant can propose; ...
 ```
 
+A PDF hit is labelled with its page (`[pdf p. 3  score …]`), and its breadcrumb ends with
+the PDF's upload name.
+
 ## MCP server
 
 `roam-semantic-search-mcp` serves every connected graph's index over stdio to any MCP
@@ -213,6 +228,10 @@ client, with four tools:
 | `semantic_search` | Ranked hits plus index meta; auto-refreshes a stale index first |
 | `refresh_index` | Incremental refresh from the live graph, on demand |
 | `index_stats` | One store's provenance |
+
+A hit's `kind` is `page`, `block`, or `pdf`. A `pdf` hit is a passage of an attached PDF:
+its `uid` is the block that embeds the PDF, and `pdf_name` and `pdf_page` say which PDF
+and page. Each PDF appears at most once, as its best-matching passage.
 
 **Staleness is bounded, and never silent.** `semantic_search` answers from the index — a
 snapshot — but when the last capture is older than the staleness threshold

@@ -116,7 +116,7 @@ class TestExtractPdfs:
         stub_window_state(monkeypatch, WindowState.CLOSED)
         result = runner.invoke(
             cli.app,
-            ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db"), "--require-open-window"],
+            ["extract-pdfs", "--graph", "SCFH", "--pdf-cache", str(tmp_path / "c.db"), "--require-open-window"],
         )
         assert result.exit_code == 0
         assert "skipped" in result.output
@@ -129,7 +129,7 @@ class TestExtractPdfs:
             )
 
         monkeypatch.setattr(cli, "extract_pdf_texts", extract_pdf_texts)
-        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db")])
+        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--pdf-cache", str(tmp_path / "c.db")])
         assert result.exit_code == 0
         assert "extracted 2" in result.output
         assert "1 no-text, 1 ok" in result.output
@@ -141,6 +141,6 @@ class TestExtractPdfs:
             raise RuntimeError("5 PDF fetches failed in a row")
 
         monkeypatch.setattr(cli, "extract_pdf_texts", extract_pdf_texts)
-        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db")])
+        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--pdf-cache", str(tmp_path / "c.db")])
         assert result.exit_code == 1
         assert "aborted" in result.output

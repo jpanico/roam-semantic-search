@@ -8,16 +8,26 @@ direct-child ``tags::`` values (its *tags*) — descendant block text folded in 
 order, and skip rules applied (system pages, daily notes on request, blocks left empty
 by cleanup).
 
+Attached PDFs contribute records of their own: :func:`pdf_chunk_records` turns the cached
+text of each PDF a block embeds (:mod:`roam_semantic_search.pdf_text`) into one record per
+chunk of a page, set in its host block's context.  Chunk text never folds into any other
+record's descendant text — a long PDF would swamp every ancestor and page record.
+
 Public symbols:
 
+- :class:`RecordKind` — what a record represents: a page, a block, or a PDF chunk.
+- :class:`PdfLocator` — where a PDF chunk record sits: which PDF, page, and chunk.
 - :class:`IndexRecord` — one embeddable record: identity, context, text, hash, bookkeeping.
 - :func:`normalized_records` — pull-block rows → the records worth indexing.
+- :func:`pdf_chunk_records` — pull-block rows + cached PDF text → one record per chunk.
+- :data:`PDF_CHUNK_MAX_CHARS` / :data:`PDF_CHUNK_OVERLAP_CHARS` — the PDF chunking sizes.
 - :data:`SKIPPED_PAGE_PREFIXES` — page-title prefixes excluded from the index (with their blocks).
 - :data:`REF_PREVIEW_MAX_CHARS` — length cap on a resolved block reference's inserted text.
 - :data:`BREADCRUMB_ANCESTOR_MAX_CHARS` — length cap on one ancestor's breadcrumb segment.
 - :data:`EMBED_INPUT_MAX_CHARS` — length cap on a record's embeddable input.
 """
 
+import enum
 import hashlib
 from collections.abc import Mapping, Sequence
 from typing import Final
@@ -27,6 +37,7 @@ from guffin.model.primitives import DAILY_NOTE_UID_PATTERN, UID_PATTERN
 from pydantic import BaseModel, ConfigDict, validate_call
 
 from roam_semantic_search.json_narrowing import is_json_list, is_json_object
+from roam_semantic_search.pdf_text import PdfStatus, PdfText, pdf_embeds, url_key
 
 SKIPPED_PAGE_PREFIXES: Final[tuple[str, ...]] = ("roam/",)
 """Page-title prefixes whose pages (and all their blocks) are excluded from the index."""
@@ -39,6 +50,14 @@ BREADCRUMB_ANCESTOR_MAX_CHARS: Final[int] = 60
 
 EMBED_INPUT_MAX_CHARS: Final[int] = 8000
 """Length cap on a record's embeddable input (breadcrumb + text)."""
+
+PDF_CHUNK_MAX_CHARS: Final[int] = 2000
+"""Length cap on one PDF chunk; a longer page splits into several chunks."""
+
+PDF_CHUNK_OVERLAP_CHARS: Final[int] = 200
+"""How much of a split page's text consecutive chunks share, so no passage is cut in two."""
+
+_PDF_KEY_CHARS: Final[int] = 8
 
 _DAILY_NOTE_UID_RE: Final[regex.Pattern[str]] = regex.compile(rf"^{DAILY_NOTE_UID_PATTERN}$")
 
@@ -62,6 +81,34 @@ _WHITESPACE_RUN_RE: Final[regex.Pattern[str]] = regex.compile(r"\s+")
 _STYLE_DELIMITERS: Final[tuple[str, ...]] = ("**", "__", "^^", "~~", "`")
 
 
+class RecordKind(enum.StrEnum):
+    """What an index record represents."""
+
+    PAGE = "page"
+    BLOCK = "block"
+    PDF = "pdf"
+    """One chunk of a page of a PDF a block embeds."""
+
+
+class PdfLocator(BaseModel):
+    """Where a PDF chunk record sits.
+
+    Attributes:
+        key: The first characters of the PDF URL's cache key (:func:`~roam_semantic_search.pdf_text.url_key`)
+            — enough to tell apart the PDFs one block embeds, never the URL itself.
+        page: The 1-based page number the chunk comes from.
+        chunk: The chunk's 1-based position within its page.
+        name: The name the PDF was uploaded under, when known.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    key: str
+    page: int
+    chunk: int
+    name: str | None = None
+
+
 class IndexRecord(BaseModel):
     """One embeddable index record derived from a page or block entity.
 
@@ -83,6 +130,8 @@ class IndexRecord(BaseModel):
         content_hash: SHA-256 hex digest of ``embed_input``.
         edited_at: The entity's latest bookkeeping timestamp (epoch ms; create/edit maximum).
         is_page: Whether the record represents a page rather than a block.
+        pdf: For a PDF chunk record, which PDF, page, and chunk it is; ``uid`` is then the
+            uid of the block that embeds the PDF.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -98,6 +147,25 @@ class IndexRecord(BaseModel):
     content_hash: str
     edited_at: int
     is_page: bool
+    pdf: PdfLocator | None = None
+
+    @property
+    def kind(self) -> RecordKind:
+        """What the record represents: a page, a block, or a PDF chunk."""
+        if self.pdf is not None:
+            return RecordKind.PDF
+        return RecordKind.PAGE if self.is_page else RecordKind.BLOCK
+
+    @property
+    def record_id(self) -> str:
+        """The record's unique identity in the store.
+
+        The Roam uid for a page or block record; ``<uid>/pdf/<key>/<page>.<chunk>`` for a
+        PDF chunk, since every chunk of every PDF a block embeds shares the block's uid.
+        """
+        if self.pdf is None:
+            return self.uid
+        return f"{self.uid}/pdf/{self.pdf.key}/{self.pdf.page}.{self.pdf.chunk}"
 
 
 def _str_field(row: Mapping[str, object], key: str) -> str | None:
@@ -468,3 +536,122 @@ def normalized_records(rows: Sequence[dict[str, object]], include_daily_notes: b
         )
 
     return [*page_records, *block_records]
+
+
+def _chunked(text: str) -> list[str]:
+    """Split a page's (whitespace-collapsed) text into overlapping chunks at word boundaries.
+
+    A text within :data:`PDF_CHUNK_MAX_CHARS` is one chunk.  A longer one is cut at the last
+    space before the cap (or at the cap, for a run with no space in its second half), and the
+    next chunk starts :data:`PDF_CHUNK_OVERLAP_CHARS` before the cut, at a word start.
+    """
+    if len(text) <= PDF_CHUNK_MAX_CHARS:
+        return [text]
+    chunks: Final[list[str]] = []
+    start: int = 0
+    while True:
+        end: int = start + PDF_CHUNK_MAX_CHARS
+        if end >= len(text):
+            chunks.append(text[start:].strip())
+            return chunks
+        space: int = text.rfind(" ", start + PDF_CHUNK_MAX_CHARS // 2, end)
+        cut: int = space if space != -1 else end
+        chunks.append(text[start:cut].strip())
+        next_start: int = cut - PDF_CHUNK_OVERLAP_CHARS
+        word_gap: int = text.find(" ", next_start, cut)
+        start = max(word_gap + 1 if word_gap != -1 else next_start, start + 1)
+
+
+def _indexable_page_dbids(rows: Sequence[Mapping[str, object]], include_daily_notes: bool) -> set[int]:
+    """The entity ids of every page the index covers (the page skip rules applied)."""
+    dbids: Final[set[int]] = set()
+    for row in rows:
+        row_id: object = row.get("id")
+        if "title" in row and isinstance(row_id, int) and _is_indexable_page(row, include_daily_notes):
+            dbids.add(row_id)
+    return dbids
+
+
+@validate_call
+def pdf_chunk_records(
+    rows: Sequence[dict[str, object]],
+    pdf_texts: Mapping[str, PdfText],
+    include_daily_notes: bool = True,
+) -> list[IndexRecord]:
+    """Derive one index record per chunk of every cached PDF the graph's blocks embed.
+
+    A block on an indexable page that embeds a PDF (``{{pdf: <url>}}`` / ``{{[[pdf]]: <url>}}``)
+    whose cached extraction is :attr:`~roam_semantic_search.pdf_text.PdfStatus.OK` yields a
+    record for each chunk of each page with a text layer (:func:`_chunked`).  A chunk record
+    carries the host block's uid, so a hit is one ``((uid))`` away from the PDF in its live
+    context; its breadcrumb is the block's context path, its own text, and the PDF's upload
+    name, and that context leads its embed input ahead of the chunk.  A PDF without a cached
+    entry, or whose entry failed or found no text, yields nothing.
+
+    Args:
+        rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
+        pdf_texts: Cached extraction results by URL key (:func:`~roam_semantic_search.pdf_text.cached_pdf_texts`).
+        include_daily_notes: Whether PDFs embedded on daily-note pages are indexed.
+
+    Returns:
+        The chunk records, in row order, then page order, then chunk order.
+    """
+    if not pdf_texts:
+        return []
+    by_dbid: Final[dict[int, dict[str, object]]] = {}
+    for row in rows:
+        row_id: object = row.get("id")
+        if isinstance(row_id, int):
+            by_dbid[row_id] = row
+    ref_texts: Final[dict[str, str]] = _reference_texts(rows)
+    indexable_page_dbids: Final[set[int]] = _indexable_page_dbids(rows, include_daily_notes)
+
+    records: Final[list[IndexRecord]] = []
+    seen: Final[set[tuple[str, str]]] = set()
+    for row in rows:
+        raw: str | None = _str_field(row, "string")
+        uid: str | None = _str_field(row, "uid")
+        if raw is None or uid is None or "pdf" not in raw:
+            continue
+        page_id: int | None = _stub_id(row, "page")
+        if page_id is None or page_id not in indexable_page_dbids:
+            continue
+        page_title: str = _str_field(by_dbid[page_id], "title") or ""
+        context: str = _breadcrumb(row, _plain_text(page_title, ref_texts) or page_title, by_dbid, ref_texts)
+        own_text: str = _plain_text(raw, ref_texts)
+        if own_text:
+            context = f"{context} › {own_text}"
+        edited_at: int = max(_int_field(row, "time"), _int_field(row, "edit-time"))
+        for embed in pdf_embeds([row]):
+            if (uid, embed.url) in seen:
+                continue
+            seen.add((uid, embed.url))
+            key: str = url_key(embed.url)
+            entry: PdfText | None = pdf_texts.get(key)
+            if entry is None or entry.status is not PdfStatus.OK:
+                continue
+            pdf_context: str = f'{context} › PDF "{entry.upload_name}"' if entry.upload_name else f"{context} › PDF"
+            for page_number, page_text in enumerate(entry.page_texts, start=1):
+                if not page_text:
+                    continue
+                for chunk_number, chunk in enumerate(_chunked(page_text), start=1):
+                    embed_input: str = _embed_input(f"{pdf_context} p. {page_number} › {chunk}", (), (), "")
+                    records.append(
+                        IndexRecord(
+                            uid=uid,
+                            page_title=page_title,
+                            breadcrumb=pdf_context,
+                            text=chunk,
+                            concepts=(),
+                            tags=(),
+                            descendant_text="",
+                            embed_input=embed_input,
+                            content_hash=_hashed(embed_input),
+                            edited_at=edited_at,
+                            is_page=False,
+                            pdf=PdfLocator(
+                                key=key[:_PDF_KEY_CHARS], page=page_number, chunk=chunk_number, name=entry.upload_name
+                            ),
+                        )
+                    )
+    return records

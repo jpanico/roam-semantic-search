@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 from guffin.roam.local_api import ApiEndpoint
 
-from roam_semantic_search.normalize import IndexRecord
+from roam_semantic_search.normalize import IndexRecord, PdfLocator
 from roam_semantic_search.refresh import RefreshPlan, refresh_plan, refresh_store
 from roam_semantic_search.store import StoreMeta, write_store
 
@@ -33,7 +33,7 @@ class TestRefreshPlan:
         records: Final[list[IndexRecord]] = [_record("uid000001", "aaa"), _record("uid000002", "bbb")]
         plan: Final[RefreshPlan] = refresh_plan(records, {"uid000001": "aaa", "uid000002": "bbb"})
         assert plan.to_embed == ()
-        assert plan.deleted_uids == ()
+        assert plan.deleted_ids == ()
         assert plan.unchanged_count == 2
 
     def test_changed_hash_selects_reembedding(self) -> None:
@@ -50,7 +50,7 @@ class TestRefreshPlan:
     def test_vanished_uid_selects_deletion(self) -> None:
         records: Final[list[IndexRecord]] = [_record("uid000001", "aaa")]
         plan: Final[RefreshPlan] = refresh_plan(records, {"uid000001": "aaa", "uid000009": "zzz"})
-        assert plan.deleted_uids == ("uid000009",)
+        assert plan.deleted_ids == ("uid000009",)
 
     def test_empty_store_embeds_everything(self) -> None:
         records: Final[list[IndexRecord]] = [_record("uid000001", "aaa"), _record("uid000002", "bbb")]
@@ -74,3 +74,25 @@ class TestSchemaVersionGuard:
         endpoint: Final[ApiEndpoint] = ApiEndpoint.from_parts(local_api_port=1, graph_name="G", bearer_token="unused")
         with pytest.raises(ValueError, match="schema"):
             refresh_store(db_path, endpoint)
+
+
+def _chunk(uid: str, page: int, content_hash: str) -> IndexRecord:
+    return _record(uid, content_hash).model_copy(update={"pdf": PdfLocator(key="abcd1234", page=page, chunk=1)})
+
+
+class TestPdfChunkPlans:
+    def test_chunks_of_one_block_diff_independently(self) -> None:
+        host: Final[IndexRecord] = _record("uid000001", "hhh")
+        one: Final[IndexRecord] = _chunk("uid000001", 1, "aaa")
+        two: Final[IndexRecord] = _chunk("uid000001", 2, "bbb")
+        plan: Final[RefreshPlan] = refresh_plan(
+            [host, one, two], {"uid000001": "hhh", one.record_id: "aaa", two.record_id: "old"}
+        )
+        assert [record.record_id for record in plan.to_embed] == ["uid000001/pdf/abcd1234/2.1"]
+        assert plan.unchanged_count == 2
+
+    def test_vanished_chunk_selects_deletion_without_touching_its_host(self) -> None:
+        host: Final[IndexRecord] = _record("uid000001", "hhh")
+        plan: Final[RefreshPlan] = refresh_plan([host], {"uid000001": "hhh", "uid000001/pdf/abcd1234/1.1": "aaa"})
+        assert plan.deleted_ids == ("uid000001/pdf/abcd1234/1.1",)
+        assert plan.to_embed == ()

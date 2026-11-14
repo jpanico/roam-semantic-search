@@ -41,10 +41,11 @@ from roam_semantic_search.embed import DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, 
 from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.graph_registry import RegisteredGraph, local_api_port, registered_graphs, resolve_graph
 from roam_semantic_search.graph_windows import WindowState, window_state_for
-from roam_semantic_search.normalize import IndexRecord, normalized_records
+from roam_semantic_search.normalize import IndexRecord, RecordKind, normalized_records, pdf_chunk_records
 from roam_semantic_search.pdf_text import (
     ExtractionSummary,
     PdfEmbed,
+    cached_pdf_texts,
     default_pdf_cache_path,
     extract_pdf_texts,
     pdf_embeds,
@@ -69,6 +70,15 @@ DbOption = Annotated[
     Path | None, typer.Option("--db", help="Index database file; defaults to ~/.cache/roam-semantic-search/<graph>.db")
 ]
 OllamaUrlOption = Annotated[str, typer.Option("--ollama-url", envvar="ROAM_SEMANTIC_SEARCH_OLLAMA_URL")]
+PdfCacheOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--pdf-cache", help="PDF text cache file; defaults to ~/.cache/roam-semantic-search/<graph>.pdf-text.db"
+    ),
+]
+IncludePdfsOption = Annotated[
+    bool, typer.Option("--pdfs/--no-pdfs", help="Index attached PDFs' cached text (cached by extract-pdfs)")
+]
 RequireOpenWindowOption = Annotated[
     bool,
     typer.Option(
@@ -102,6 +112,11 @@ def _canonical_graph_name(selector: str) -> str:
 def _store_path(selector: str, db_path: Path | None) -> Path:
     """The store to operate on: an explicit ``--db``, else the graph's default location."""
     return db_path if db_path is not None else default_db_path(_canonical_graph_name(selector))
+
+
+def _pdf_cache_path(selector: str, cache_path: Path | None) -> Path:
+    """The PDF text cache to use: an explicit ``--pdf-cache``, else the graph's default location."""
+    return cache_path if cache_path is not None else default_pdf_cache_path(_canonical_graph_name(selector))
 
 
 def _api_endpoint(selector: str, port: int | None, token: str | None) -> ApiEndpoint:
@@ -166,15 +181,30 @@ def build(
     model: Annotated[str, typer.Option("--model")] = DEFAULT_EMBED_MODEL,
     ollama_url: OllamaUrlOption = DEFAULT_OLLAMA_URL,
     include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
+    include_pdfs: IncludePdfsOption = True,
+    pdf_cache_path: PdfCacheOption = None,
 ) -> None:
-    """Fetch the graph, normalize, embed locally, and (re)write the index store."""
+    """Fetch the graph, normalize, embed locally, and (re)write the index store.
+
+    Attached PDFs are indexed from the PDF text cache that ``extract-pdfs`` fills; a PDF
+    the cache lacks gets no records (nothing here fetches PDFs).
+    """
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
     resolved_db: Final[Path] = _store_path(graph, db_path)
 
     started: Final[float] = time.perf_counter()
     rows: Final[list[dict[str, object]]] = fetch_graph(api_endpoint)
     records: Final[list[IndexRecord]] = normalized_records(rows, include_daily_notes=include_daily_notes)
-    typer.echo(f"fetched {len(rows)} entities; {len(records)} indexable records")
+    if include_pdfs:
+        records.extend(
+            pdf_chunk_records(
+                rows,
+                cached_pdf_texts(_pdf_cache_path(graph, pdf_cache_path)),
+                include_daily_notes=include_daily_notes,
+            )
+        )
+    pdf_count: Final[int] = sum(1 for record in records if record.kind is RecordKind.PDF)
+    typer.echo(f"fetched {len(rows)} entities; {len(records)} indexable records ({pdf_count} PDF chunks)")
 
     vectors: Final[list[list[float]]] = embed_texts(
         [record.embed_input for record in records], model=model, base_url=ollama_url
@@ -225,9 +255,14 @@ def refresh(
     db_path: DbOption = None,
     ollama_url: OllamaUrlOption = DEFAULT_OLLAMA_URL,
     include_daily_notes: Annotated[bool, typer.Option("--daily-notes/--no-daily-notes")] = True,
+    include_pdfs: IncludePdfsOption = True,
+    pdf_cache_path: PdfCacheOption = None,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
     """Incrementally update the store: re-embed only changed records, delete vanished ones.
+
+    Attached PDFs are indexed from the PDF text cache (``extract-pdfs``); a schema-v2 store
+    is upgraded in place first, embeddings kept.
 
     Fetching reaches the graph through the Roam Local API, and a request naming a graph Roam
     Desktop cannot serve makes it open a window — an unlock prompt, for an encrypted graph.
@@ -244,7 +279,12 @@ def refresh(
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
     started: Final[float] = time.perf_counter()
     summary: Final[RefreshSummary] = refresh_store(
-        resolved_db, api_endpoint, ollama_url=ollama_url, include_daily_notes=include_daily_notes
+        resolved_db,
+        api_endpoint,
+        ollama_url=ollama_url,
+        include_daily_notes=include_daily_notes,
+        include_pdfs=include_pdfs,
+        pdf_cache_path=_pdf_cache_path(graph, pdf_cache_path),
     )
     elapsed: Final[float] = time.perf_counter() - started
     typer.echo(
@@ -259,12 +299,7 @@ def extract_pdfs(
     graph: GraphOption,
     port: PortOption = None,
     token: TokenOption = None,
-    cache_path: Annotated[
-        Path | None,
-        typer.Option(
-            "--cache", help="PDF text cache file; defaults to ~/.cache/roam-semantic-search/<graph>.pdf-text.db"
-        ),
-    ] = None,
+    pdf_cache_path: PdfCacheOption = None,
     retry_failed: Annotated[
         bool, typer.Option("--retry-failed", help="Refetch PDFs whose fetch or parse failed before")
     ] = False,
@@ -281,9 +316,7 @@ def extract_pdfs(
     if require_open_window and _open_window_refused(graph):
         return
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
-    resolved_cache: Final[Path] = (
-        cache_path if cache_path is not None else default_pdf_cache_path(_canonical_graph_name(graph))
-    )
+    resolved_cache: Final[Path] = _pdf_cache_path(graph, pdf_cache_path)
     started: Final[float] = time.perf_counter()
     embeds: Final[list[PdfEmbed]] = pdf_embeds(fetch_graph(api_endpoint))
     try:
@@ -323,7 +356,7 @@ def search(
         raise typer.Exit(code=1)
     hits: Final[list[SearchHit]] = search_store(resolved_db, query, k=k, ollama_url=ollama_url)
     for rank, hit in enumerate(hits, start=1):
-        kind: str = "page" if hit.is_page else "block"
+        kind: str = f"pdf p. {hit.pdf_page}" if hit.kind is RecordKind.PDF else str(hit.kind)
         ranks: str = f"v:{hit.vector_rank or '-'} k:{hit.keyword_rank or '-'}"
         typer.echo(f"{rank:2}. (({hit.uid}))  [{kind}  score {hit.score:.4f}  {ranks}]")
         typer.echo(f"    {hit.breadcrumb}")

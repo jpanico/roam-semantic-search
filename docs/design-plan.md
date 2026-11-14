@@ -262,8 +262,8 @@ roam-semantic-search/
   `refresh_index` — which happen only while the user is present to see why a listed window
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
-- **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement) and 5b
-  (extraction) DONE 2026-11-13.** Index the text inside attached PDFs — about 1,400 in
+- **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement), 5b
+  (extraction), and 5c (records and search) DONE 2026-11-13.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
 
@@ -348,14 +348,23 @@ protection — Phase 5a's job.
   block's Roam uid (Constraint 3: every hit one `((uid))` away), joined by `kind` and
   `pdf_page` columns; the FTS mirror keys by `record_id`. The refresh diff keys by
   `record_id` and is otherwise unchanged — content-hash selection covers chunks as-is.
-  The existing schema-version guard forces the full rebuild.
+  *As built (5c):* no rebuild. A v2 record is a page or block record whose
+  `record_id` is its uid, so `store.upgrade_store` migrates a v2 store in place — rows
+  and FTS entries copied, embeddings kept, in one immediate transaction — and needs
+  neither Roam Desktop nor Ollama. Refresh and search both run it first, so SCFH's
+  index upgrades the next time it is touched, even while the graph stays closed.
 - **Module placement.** `normalize.py` stays pure. A new `pdf_text.py` finds PDF embeds
   in the pulled rows, consults the cache, and fetches and extracts the misses; a pure
-  `pdf_chunk_records(rows, texts)` turns cached texts into `IndexRecord`s. `build` and
-  `refresh` call both.
+  `pdf_chunk_records(rows, texts)` turns cached texts into `IndexRecord`s. *As built:*
+  `pdf_chunk_records` lives in `normalize.py` beside the breadcrumb machinery it reuses,
+  and `build` / `refresh` only *read* the cache — fetching stays the explicit
+  `extract-pdfs` command until 5d gives refresh a budget, so no search-triggered
+  auto-refresh can start a large fetch.
 - **Query.** Collapse to the best chunk per (host uid, PDF) before taking the top *k*,
   so one long PDF cannot fill the results. `SearchHit` and the MCP response gain
-  `kind`, `pdf_name`, `pdf_page`.
+  `kind`, `pdf_name`, `pdf_page`. Each leg's candidate pool widens to
+  `max(10k, 200)` (from `max(4k, 50)`), so the collapse still leaves *k* distinct hits
+  when one PDF's chunks crowd the top of a ranking.
 - **Refresh budget.** The pre-search auto-refresh must stay quick: it fetches at most N
   new PDFs or T seconds' worth, and `RefreshSummary` and the MCP `refresh` field report
   `pdf_pending`. A new `extract-pdfs --graph` command (and `build`) works the backlog.
@@ -368,7 +377,8 @@ protection — Phase 5a's job.
 - **Privacy.** Fully local, like everything else. The new exposure is the text cache:
   decrypted text of tax, medical, and estate documents at rest. It is the same class as
   the store, which already holds decrypted block text — and both stores are `0644`
-  today. Create the text cache `0600`, and tighten the stores to match.
+  today. Create the text cache `0600`, and tighten the stores to match. *Done in 5b
+  (cache) and 5c (stores).*
 - **Daily notes.** PDF chunks follow `--no-daily-notes` like their host blocks.
 
 ### Sub-phases
@@ -393,9 +403,22 @@ protection — Phase 5a's job.
   is not the trigger, and accumulated state in a long-lived process is the likelier one.
   The finished cache matches 5a exactly: 1,408 PDFs — 1,233 `ok`, 157 `no-text`, 17
   `password`, 1 `fetch-failed` — in a 16 MB file.
-- **5c — records and search.** Chunk records, schema v3, best-chunk collapse, the new
-  hit fields in MCP and CLI; rebuild hippo.
-- **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting.
+- **5c — records and search: DONE 2026-11-13.** Chunk records (`normalize.pdf_chunk_records`),
+  schema v3 with the in-place v2 upgrade instead of a rebuild, the best-chunk collapse
+  and wider candidate pools, and `kind` / `pdf_name` / `pdf_page` on CLI and MCP hits;
+  `build` and `refresh` take `--pdfs/--no-pdfs` and `--pdf-cache` (now `extract-pdfs`'
+  spelling too). Stores are created owner-only and an older world-readable store is
+  tightened on its next refresh or search, since a store now holds PDF text as well. Live
+  on hippo, one `refresh` upgraded the store and embedded **11,451 chunks in 648 s**
+  (25,612 records; the store grew from 70 to 180 MB). That is more than 5a's projected
+  10,433, because cutting at a word boundary in the chunk's second half yields shorter
+  chunks than 5a's character arithmetic assumed. A search, query embedding included,
+  answers in ~120 ms. Spot checks found the right PDF passage for an appliance-manual
+  question, a hotel booking, and tax forms, one hit per PDF alongside block hits.
+- **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting —
+  and, since 5c, a cap on chunk *embeddings* per auto-refresh: after an `extract-pdfs`
+  run adds many PDFs, the next pre-search refresh would otherwise embed every new chunk
+  before answering (hippo's ~10,400 take ~10 minutes).
 - **5e — OCR, following 5c.** macOS Vision, on-device, for pages without a text layer;
   an extractor-version bump re-extracts just those entries. 5a settled the "only if":
   157 PDFs are fully scanned and unfindable without it.
