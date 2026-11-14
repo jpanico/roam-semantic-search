@@ -262,10 +262,10 @@ roam-semantic-search/
   `refresh_index` — which happen only while the user is present to see why a listed window
   came forward. No launchd agent remains.
 - **Phase 4 (optional, demand-driven):** result reranking.
-- **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement) DONE
-  2026-11-13.** Index the text inside attached PDFs — about 1,400 in hippo, most of them
-  encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's results are in
-  *PDF attachments* below.
+- **Phase 5 — PDF attachment text: PLANNED 2026-11-13; 5a (measurement) and 5b
+  (extraction) DONE 2026-11-13.** Index the text inside attached PDFs — about 1,400 in
+  hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
+  results are in *PDF attachments* below.
 
 ## Phase 0 results (2026-08-04, live SCFH)
 
@@ -359,8 +359,12 @@ protection — Phase 5a's job.
 - **Refresh budget.** The pre-search auto-refresh must stay quick: it fetches at most N
   new PDFs or T seconds' worth, and `RefreshSummary` and the MCP `refresh` field report
   `pdf_pending`. A new `extract-pdfs --graph` command (and `build`) works the backlog.
-- **Failure posture.** A bad PDF never fails a refresh: its status is cached, and it is
-  not retried until the extractor version moves or `--retry-failed` is passed.
+- **Failure posture.** A bad PDF never fails a refresh: its status is cached and decides
+  when it comes back. `password` never does (an upload never changes); `fetch-failed`
+  only with `--retry-failed`; `parse-failed` with `--retry-failed` or a newer extractor;
+  `ok` / `no-text` with a newer extractor alone. A run of five fetch failures in a row is
+  different in kind — the graph is failing (closed, or locked mid-run), not its files —
+  so it aborts the run *without* caching that run, leaving those PDFs to be retried.
 - **Privacy.** Fully local, like everything else. The new exposure is the text cache:
   decrypted text of tax, medical, and estate documents at rest. It is the same class as
   the store, which already holds decrypted block text — and both stores are `0644`
@@ -373,9 +377,18 @@ protection — Phase 5a's job.
   into memory only; record bytes, fetch time, pages, text-layer yield, and the
   password-protected count. Decides whether OCR belongs in the first cut and what a first
   build costs. SCFH is still to be measured, the next time it is open.
-- **5b — extraction.** Fix `FIREBASE_STORAGE_URL_PATTERN` upstream in guffin (the three
-  misses above; guffin's own asset handling shares the pattern). Text cache, pypdfium2
-  extraction, `extract-pdfs`; tests over fixture PDFs.
+- **5b — extraction: DONE 2026-11-13.** guffin's `FIREBASE_STORAGE_URL_PATTERN` now
+  admits the characters `encodeURIComponent` leaves literal (`!~*'()`), so all 1,411
+  hippo embeds parse. `pdf_text.py` (embed discovery, pypdfium2 extraction, the
+  owner-only text cache) and `extract-pdfs`; tests over generated fixture PDFs plus a
+  qpdf-encrypted one. Live on hippo, 1,246 of 1,408 PDFs were cached (1,085 `ok`, 144
+  `no-text`, 16 `password`, 1 `fetch-failed`; a 15 MB cache file) before **Roam Desktop
+  crashed mid-run** — 18:34, `EXC_BREAKPOINT` in V8 string creation on Electron's main
+  thread, in a process up for 7 days. The run had moved ~1.3 GB through `file.get`, on top
+  of 5a's ~1.5 GB through the same process an hour earlier, and the largest PDF still
+  pending is 84.6 MB. Cause unconfirmed; plausibly the main process building a ~110 MB
+  base64 string under accumulated memory pressure. The cache kept every completed entry,
+  as designed, and 162 PDFs remain pending.
 - **5c — records and search.** Chunk records, schema v3, best-chunk collapse, the new
   hit fields in MCP and CLI; rebuild hippo.
 - **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting.
@@ -424,6 +437,10 @@ Findings beyond the raw numbers:
 
 ### Risks
 
+- **`file.get` can crash Roam Desktop** (5b's live run). Each fetch hands the whole file
+  to Roam's Electron main process as one base64 string. Until the cause is known, work a
+  backlog in batches (`--limit`), and make 5d's budget cap bytes per run, not only count
+  or time.
 - **Search-time matrix load.** Every search loads the whole embedding matrix — hippo's
   is ~44 MB at 14,162 records today; 5a's 10,433 chunks would take it to ~75 MB. If
   that shows in search latency, keep the matrix resident in the MCP server between

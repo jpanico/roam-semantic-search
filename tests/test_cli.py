@@ -1,13 +1,15 @@
-"""Tests for the CLI's open-window gate: what a scheduled refresh does when the graph is closed."""
+"""Tests for the CLI's open-window gate (what a scheduled run does when the graph is closed) and extract-pdfs."""
 
 from pathlib import Path
 from typing import Final
 
 import pytest
+from guffin.roam.local_api import ApiEndpoint
 from typer.testing import CliRunner
 
 from roam_semantic_search import cli
 from roam_semantic_search.graph_windows import WindowState
+from roam_semantic_search.pdf_text import ExtractionSummary, PdfStatus
 from roam_semantic_search.refresh import RefreshSummary
 
 runner: Final[CliRunner] = CliRunner()
@@ -86,3 +88,59 @@ class TestRefreshOpenWindowGate:
         result = runner.invoke(cli.app, ["refresh", "--graph", "SCFH", "--db", str(store)])
         assert result.exit_code == 0
         assert reached == [store]
+
+
+@pytest.fixture
+def pdf_run(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Stub extract-pdfs' Local API reach; records each graph whose endpoint was built."""
+    endpoints: Final[list[str]] = []
+
+    def api_endpoint(selector: str, port: int | None, token: str | None) -> ApiEndpoint:
+        endpoints.append(selector)
+        return ApiEndpoint.from_parts(local_api_port=1, graph_name=selector, bearer_token="unused")
+
+    def fetch_graph(endpoint: ApiEndpoint) -> list[dict[str, object]]:
+        return []
+
+    monkeypatch.setattr(cli, "_api_endpoint", api_endpoint)
+    monkeypatch.setattr(cli, "fetch_graph", fetch_graph)
+    return endpoints
+
+
+class TestExtractPdfs:
+    """extract-pdfs: the open-window gate, the summary line, and the abort exit."""
+
+    def test_closed_window_skips_without_touching_the_api(
+        self, tmp_path: Path, pdf_run: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        stub_window_state(monkeypatch, WindowState.CLOSED)
+        result = runner.invoke(
+            cli.app,
+            ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db"), "--require-open-window"],
+        )
+        assert result.exit_code == 0
+        assert "skipped" in result.output
+        assert pdf_run == []
+
+    def test_reports_the_run(self, tmp_path: Path, pdf_run: list[str], monkeypatch: pytest.MonkeyPatch) -> None:
+        def extract_pdf_texts(*args: object, **kwargs: object) -> ExtractionSummary:
+            return ExtractionSummary(
+                distinct_count=3, current_count=1, outcomes={PdfStatus.OK: 1, PdfStatus.NO_TEXT: 1}, pending_count=0
+            )
+
+        monkeypatch.setattr(cli, "extract_pdf_texts", extract_pdf_texts)
+        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db")])
+        assert result.exit_code == 0
+        assert "extracted 2" in result.output
+        assert "1 no-text, 1 ok" in result.output
+
+    def test_a_failing_graph_aborts_with_exit_1(
+        self, tmp_path: Path, pdf_run: list[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def extract_pdf_texts(*args: object, **kwargs: object) -> ExtractionSummary:
+            raise RuntimeError("5 PDF fetches failed in a row")
+
+        monkeypatch.setattr(cli, "extract_pdf_texts", extract_pdf_texts)
+        result = runner.invoke(cli.app, ["extract-pdfs", "--graph", "SCFH", "--cache", str(tmp_path / "c.db")])
+        assert result.exit_code == 1
+        assert "aborted" in result.output

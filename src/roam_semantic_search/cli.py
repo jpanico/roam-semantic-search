@@ -5,6 +5,7 @@ Commands:
 - ``graphs`` — list the graphs connected on this machine and which of them are indexed.
 - ``build`` — fetch the graph, normalize, embed locally, and (re)write the index store.
 - ``refresh`` — incrementally update the store: re-embed only changed records, delete vanished ones.
+- ``extract-pdfs`` — fetch the graph's attached PDFs and cache their text, for indexing.
 - ``search`` — answer a natural-language query from the store.
 - ``stats`` — print the store's provenance and embedding-model facts.
 
@@ -33,6 +34,7 @@ from typing import Annotated, Final
 import numpy as np
 import typer
 from guffin.roam.local_api import ApiEndpoint
+from guffin.roam.local_api_source import LocalApiGraphSource
 from numpy.typing import NDArray
 
 from roam_semantic_search.embed import DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, embed_texts
@@ -40,6 +42,13 @@ from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.graph_registry import RegisteredGraph, local_api_port, registered_graphs, resolve_graph
 from roam_semantic_search.graph_windows import WindowState, window_state_for
 from roam_semantic_search.normalize import IndexRecord, normalized_records
+from roam_semantic_search.pdf_text import (
+    ExtractionSummary,
+    PdfEmbed,
+    default_pdf_cache_path,
+    extract_pdf_texts,
+    pdf_embeds,
+)
 from roam_semantic_search.query import SearchHit, search_store
 from roam_semantic_search.refresh import RefreshSummary, refresh_store
 from roam_semantic_search.store import StoreMeta, default_db_path, read_meta, write_store
@@ -242,6 +251,60 @@ def refresh(
         f"refreshed {resolved_db} in {elapsed:.1f}s: {summary.embedded_count} re-embedded,"
         f" {summary.deleted_count} deleted, {summary.unchanged_count} unchanged"
         f" ({summary.record_count} records)"
+    )
+
+
+@app.command("extract-pdfs")
+def extract_pdfs(
+    graph: GraphOption,
+    port: PortOption = None,
+    token: TokenOption = None,
+    cache_path: Annotated[
+        Path | None,
+        typer.Option(
+            "--cache", help="PDF text cache file; defaults to ~/.cache/roam-semantic-search/<graph>.pdf-text.db"
+        ),
+    ] = None,
+    retry_failed: Annotated[
+        bool, typer.Option("--retry-failed", help="Refetch PDFs whose fetch or parse failed before")
+    ] = False,
+    limit: Annotated[int | None, typer.Option("--limit", min=1, help="Fetch at most this many PDFs")] = None,
+    require_open_window: RequireOpenWindowOption = False,
+) -> None:
+    """Fetch the graph's attached PDFs and cache their text, for indexing.
+
+    Every PDF a block embeds is fetched decrypted through the Roam Local API, held in memory
+    only, and its text layer cached page by page in an owner-only file; already-cached PDFs
+    are skipped, so a run picks up where the last one stopped.  Reaching the graph can make
+    Roam Desktop open a window for it — see ``refresh`` for ``--require-open-window``.
+    """
+    if require_open_window and _open_window_refused(graph):
+        return
+    api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
+    resolved_cache: Final[Path] = (
+        cache_path if cache_path is not None else default_pdf_cache_path(_canonical_graph_name(graph))
+    )
+    started: Final[float] = time.perf_counter()
+    embeds: Final[list[PdfEmbed]] = pdf_embeds(fetch_graph(api_endpoint))
+    try:
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            resolved_cache,
+            embeds,
+            LocalApiGraphSource(api_endpoint=api_endpoint),
+            retry_failed=retry_failed,
+            limit=limit,
+        )
+    except RuntimeError as error:
+        typer.echo(f"aborted: {error}", err=True)
+        raise typer.Exit(code=1) from error
+    elapsed: Final[float] = time.perf_counter() - started
+    outcomes: Final[str] = (
+        ", ".join(f"{count} {status}" for status, count in sorted(summary.outcomes.items())) or "none"
+    )
+    typer.echo(
+        f"{resolved_cache}: {summary.distinct_count} distinct PDFs in {len(embeds)} embeds;"
+        f" extracted {summary.extracted_count} in {elapsed:.1f}s ({outcomes});"
+        f" {summary.current_count} already current, {summary.pending_count} pending"
     )
 
 

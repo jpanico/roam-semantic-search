@@ -124,12 +124,35 @@ graph, and its token is the wrong credential for any other.
 roam-semantic-search graphs                       # connected graphs and their index state
 roam-semantic-search build --graph brain          # full fetch → normalize → embed → store (~100 s for ~8k records)
 roam-semantic-search refresh --graph brain        # incremental: re-embed only what changed (~2 s when idle)
+roam-semantic-search extract-pdfs --graph brain   # cache attached PDFs' text (~17 min first time for ~1,400 PDFs)
 roam-semantic-search search --graph scfh "why the human must stay responsible" -k 5
 roam-semantic-search stats --graph scfh           # store provenance: model, counts, build/refresh moments
 ```
 
 `--port` and `--token` are needed only to override the registry, or to reach a graph it
 does not know about.
+
+### PDF attachments: `extract-pdfs`
+
+The index does not yet search inside attached PDFs (that is Phase 5c of
+`docs/design-plan.md`); `extract-pdfs` is the step that makes it possible. It fetches every
+PDF a block embeds (`{{pdf: …}}` / `{{[[pdf]]: …}}`) through the Local API — decrypted, for
+an encrypted graph — holds it in memory only, and caches its text layer page by page in
+`~/.cache/roam-semantic-search/<graph>.pdf-text.db` (`--cache` overrides). That file holds
+decrypted text, so it is created owner-only (`0600`); no PDF bytes are written to disk, and
+entries are keyed by a digest of the URL rather than the URL (which embeds an access token).
+
+A run skips every PDF already cached, so it resumes where the last one stopped; `--limit N`
+caps a run. Each PDF lands as `ok`, `no-text` (a scan, awaiting OCR), `password`,
+`parse-failed`, or `fetch-failed`. A password-protected PDF is never refetched — an upload
+never changes — while `--retry-failed` refetches the two failure kinds. Five fetch failures
+in a row abort the run without caching them: at that point the graph, not its files, is
+failing. Like `refresh`, it takes `--require-open-window`.
+
+**Work a large backlog in batches.** Every PDF passes through Roam Desktop as one base64
+string, and on 2026-11-13 an unbatched first run crashed Roam Desktop after ~1.3 GB (about
+1,250 PDFs). Until that is understood, prefer `--limit 200` runs; each one resumes where
+the last stopped.
 
 ### Unattended refreshes: `--require-open-window`
 
