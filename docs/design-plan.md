@@ -535,11 +535,15 @@ Findings beyond the raw numbers:
   keeps the code it started with, and the Claude app keeps reporting it healthy (✓, no
   Reconnect in `/mcp`). After 5c changed the store schema, the app's still-running copies
   failed every hippo search with `no such column: uid` — the error naming a symptom, not
-  the cause. The server now records the `(mtime, size)` of every source file it loaded
-  from this package and guffin, re-checks them before each tool call, and once any has
-  changed fails the call with a message saying to restart it (quit and reopen Claude, or
-  the terminal `claude`). Refusing rather than warning is deliberate: old code reading an
-  index or cache newer code wrote can answer wrongly as well as fail. Found the same day:
+  the cause. The server now fingerprints every source file it loaded from this package
+  and guffin — modification time, size, and SHA-256 of the content — re-checks them
+  before each tool call, and once any file's content has changed fails the call with a
+  message saying to restart it (quit and reopen Claude, or the terminal `claude`).
+  Refusing rather than warning is deliberate: old code reading an index or cache newer
+  code wrote can answer wrongly as well as fail. The first version compared only
+  `(mtime, size)` and tripped within minutes: fast-forwarding `main` from a feature branch
+  rewrote `mcp_server.py` with identical content and a new time. A file whose time or size
+  moved is now read and its content compared, so only a real change counts. Found the same day:
   the server was registered both in the Claude app's config and in `~/.claude.json`, so
   each Code-tab session started an extra copy that never answered; the user-scope
   registrations were removed and the README now says to register once per client.

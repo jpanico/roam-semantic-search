@@ -1,5 +1,7 @@
 """Tests for the MCP server's staleness judgment."""
 
+import hashlib
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -181,9 +183,15 @@ class TestInteractivePdfBudget:
         assert outcome.summary == leftover
 
 
-def _recorded(path: Path) -> dict[str, tuple[int, int]]:
+def _recorded(path: Path) -> dict[str, mcp_server.SourceFingerprint]:
     status = path.stat()
-    return {str(path): (status.st_mtime_ns, status.st_size)}
+    digest: Final[str] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return {str(path): mcp_server.SourceFingerprint(status.st_mtime_ns, status.st_size, digest)}
+
+
+def _bump_mtime(path: Path) -> None:
+    status = path.stat()
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1_000_000_000))
 
 
 class TestStaleCodeGuard:
@@ -197,10 +205,27 @@ class TestStaleCodeGuard:
     def test_an_edited_or_removed_source_is_reported(self, tmp_path: Path) -> None:
         source: Final[Path] = tmp_path / "module.py"
         source.write_text("x = 1\n")
-        baseline: Final[dict[str, tuple[int, int]]] = _recorded(source)
+        baseline: Final[dict[str, mcp_server.SourceFingerprint]] = _recorded(source)
         source.write_text("x = 2  # edited\n")
         assert mcp_server.changed_sources(baseline) == [str(source)]
         source.unlink()
+        assert mcp_server.changed_sources(baseline) == [str(source)]
+
+    def test_a_rewrite_with_identical_content_is_not_a_change(self, tmp_path: Path) -> None:
+        """A git branch switch or fast-forward rewrites files unchanged, with a new modification time."""
+        source: Final[Path] = tmp_path / "module.py"
+        source.write_text("x = 1\n")
+        baseline: Final[dict[str, mcp_server.SourceFingerprint]] = _recorded(source)
+        source.write_text("x = 1\n")
+        _bump_mtime(source)
+        assert mcp_server.changed_sources(baseline) == []
+
+    def test_a_same_size_edit_is_caught_by_content(self, tmp_path: Path) -> None:
+        source: Final[Path] = tmp_path / "module.py"
+        source.write_text("x = 1\n")
+        baseline: Final[dict[str, mcp_server.SourceFingerprint]] = _recorded(source)
+        source.write_text("x = 2\n")
+        _bump_mtime(source)
         assert mcp_server.changed_sources(baseline) == [str(source)]
 
     def test_a_stale_server_refuses_every_tool(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

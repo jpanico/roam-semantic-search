@@ -34,9 +34,11 @@ PDF work.  The CLI's ``refresh`` and ``extract-pdfs`` work a backlog through.
 A running server keeps the code it started with, and the app that launched it keeps
 reporting it healthy, so a server outliving a change to this project — or to guffin —
 would go on answering from old code, at best failing opaquely against an index or cache
-the new code wrote.  The server therefore records the source files it loaded at startup
-and checks them before every tool call: once any has changed on disk, every call fails
-with a message saying to restart the server (:func:`ensure_current_code`).
+the new code wrote.  The server therefore fingerprints the source files it loaded at
+startup and checks them before every tool call: once any file's *content* has changed on
+disk, every call fails with a message saying to restart the server
+(:func:`ensure_current_code`).  A rewrite with identical content — a git branch switch,
+say — does not count.
 
 A search answers from the index — a snapshot — never from the live graph.  To bound how
 stale an answer can be, ``semantic_search`` first auto-refreshes the index when its last
@@ -49,13 +51,14 @@ tool schemas), so they carry no ``@validate_call`` — the framework validates a
 """
 
 import enum
+import hashlib
 import logging
 import os
 import sys
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Final
+from typing import Final, NamedTuple
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, validate_call
@@ -168,34 +171,58 @@ _WATCHED_PACKAGES: Final[frozenset[str]] = frozenset({"roam_semantic_search", "g
 """Top-level packages whose loaded source files the stale-code check watches."""
 
 
-def loaded_source_stats(packages: frozenset[str] = _WATCHED_PACKAGES) -> dict[str, tuple[int, int]]:
-    """The modification time and size of every loaded source file of *packages*, by path.
+class SourceFingerprint(NamedTuple):
+    """One loaded source file as it was at startup.
+
+    Attributes:
+        mtime_ns: Its modification time, in nanoseconds.
+        size: Its size in bytes.
+        digest: The SHA-256 hex digest of its content.
+    """
+
+    mtime_ns: int
+    size: int
+    digest: str
+
+
+def _digest(path: str) -> str:
+    """The SHA-256 hex digest of a file's content."""
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def loaded_source_fingerprints(packages: frozenset[str] = _WATCHED_PACKAGES) -> dict[str, SourceFingerprint]:
+    """The fingerprint of every loaded source file of *packages*, by path.
 
     Args:
         packages: Top-level package names whose loaded modules are fingerprinted.
 
     Returns:
-        ``(mtime_ns, size)`` per ``.py`` file of a module of *packages* currently in
+        A :class:`SourceFingerprint` per ``.py`` file of a module of *packages* currently in
         :data:`sys.modules`.
     """
-    stats: Final[dict[str, tuple[int, int]]] = {}
+    fingerprints: Final[dict[str, SourceFingerprint]] = {}
     for name, module in list(sys.modules.items()):
         path: object = getattr(module, "__file__", None)
         if name.partition(".")[0] not in packages or not isinstance(path, str) or not path.endswith(".py"):
             continue
         try:
             status: os.stat_result = os.stat(path)
+            fingerprints[path] = SourceFingerprint(status.st_mtime_ns, status.st_size, _digest(path))
         except OSError:
             continue
-        stats[path] = (status.st_mtime_ns, status.st_size)
-    return stats
+    return fingerprints
 
 
-def changed_sources(baseline: Mapping[str, tuple[int, int]]) -> list[str]:
-    """The files of *baseline* whose modification time or size has changed, or that vanished.
+def changed_sources(baseline: Mapping[str, SourceFingerprint]) -> list[str]:
+    """The files of *baseline* whose content has changed, or that vanished.
+
+    A file whose modification time and size are as recorded is taken as unchanged without
+    being read.  One whose time or size moved is read and its content compared: a git
+    branch switch, a fast-forward, or a stash round trip rewrites files with identical
+    content and a new time, and that must not count as a change.
 
     Args:
-        baseline: ``(mtime_ns, size)`` by path, as :func:`loaded_source_stats` recorded it.
+        baseline: The fingerprints :func:`loaded_source_fingerprints` recorded, by path.
 
     Returns:
         The changed paths, sorted.
@@ -204,11 +231,13 @@ def changed_sources(baseline: Mapping[str, tuple[int, int]]) -> list[str]:
     for path, recorded in baseline.items():
         try:
             status: os.stat_result = os.stat(path)
+            if (status.st_mtime_ns, status.st_size) == (recorded.mtime_ns, recorded.size):
+                continue
+            if status.st_size == recorded.size and _digest(path) == recorded.digest:
+                continue
         except OSError:
-            changed.append(path)
-            continue
-        if (status.st_mtime_ns, status.st_size) != recorded:
-            changed.append(path)
+            pass
+        changed.append(path)
     return sorted(changed)
 
 
@@ -345,7 +374,7 @@ def _store_for(graph: str) -> Path:
     return db_path
 
 
-_STARTUP_SOURCES: Final[dict[str, tuple[int, int]]] = loaded_source_stats()
+_STARTUP_SOURCES: Final[dict[str, SourceFingerprint]] = loaded_source_fingerprints()
 """The source files this server loaded, as they were at startup (every import above is done)."""
 
 

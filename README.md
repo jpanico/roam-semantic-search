@@ -295,9 +295,10 @@ share sessions runs two copies, and only one of them answers.
 **A running server keeps the code it started with.** After changing this project, restart
 whatever runs the server — quit and reopen the Claude app (⌘Q; a server that is still
 connected offers no Reconnect in `/mcp`), or restart the terminal `claude` session. The
-server notices when you forget: it records the source files it loaded (this project's and
-guffin's) and, once any has changed on disk, fails every tool call with a message saying
-to restart it, rather than answering from old code.
+server notices when you forget: it fingerprints the source files it loaded (this project's
+and guffin's) and, once any file's content has changed on disk, fails every tool call with
+a message saying to restart it, rather than answering from old code. A git branch switch
+or fast-forward that rewrites files with the same content does not count.
 
 **`semantic_search`, `refresh_index`, and `index_stats` each require a `graph`
 argument.** That is deliberate rather than an ergonomic oversight: with several graphs
