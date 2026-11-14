@@ -388,7 +388,11 @@ protection — Phase 5a's job.
   of 5a's ~1.5 GB through the same process an hour earlier, and the largest PDF still
   pending is 84.6 MB. Cause unconfirmed; plausibly the main process building a ~110 MB
   base64 string under accumulated memory pressure. The cache kept every completed entry,
-  as designed, and 162 PDFs remain pending.
+  as designed. After a Roam relaunch, one resumed `--limit 200` run (21:49) fetched the
+  remaining 162 in 121 s without incident, the 84.6 MB PDF included — so the file alone
+  is not the trigger, and accumulated state in a long-lived process is the likelier one.
+  The finished cache matches 5a exactly: 1,408 PDFs — 1,233 `ok`, 157 `no-text`, 17
+  `password`, 1 `fetch-failed` — in a 16 MB file.
 - **5c — records and search.** Chunk records, schema v3, best-chunk collapse, the new
   hit fields in MCP and CLI; rebuild hippo.
 - **5d — refresh budget.** The per-refresh fetch cap and `pdf_pending` reporting.
@@ -438,9 +442,12 @@ Findings beyond the raw numbers:
 ### Risks
 
 - **`file.get` can crash Roam Desktop** (5b's live run). Each fetch hands the whole file
-  to Roam's Electron main process as one base64 string. Until the cause is known, work a
-  backlog in batches (`--limit`), and make 5d's budget cap bytes per run, not only count
-  or time.
+  to Roam's Electron main process as one base64 string. The crash followed ~2.8 GB of such
+  traffic through a week-old process, while a fresh process then served the largest
+  pending file without trouble, so volume per process looks like the trigger rather than
+  any one file. Until the cause is known, work a backlog in batches (`--limit`), ideally
+  soon after a Roam relaunch, and make 5d's budget cap bytes per run, not only count or
+  time.
 - **Search-time matrix load.** Every search loads the whole embedding matrix — hippo's
   is ~44 MB at 14,162 records today; 5a's 10,433 chunks would take it to ~75 MB. If
   that shows in search latency, keep the matrix resident in the MCP server between
