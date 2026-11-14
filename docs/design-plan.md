@@ -267,6 +267,10 @@ roam-semantic-search/
   DONE 2026-11-14.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
+- **Phase 6 — image attachment text: PLANNED 2026-11-14.** Index the text inside
+  attached images: SVGs first (6a — their text is in the XML, no OCR needed), then,
+  only if a measurement justifies it, raster images by OCR (6b measure, 6c build).
+  Measurements, design, and sub-phases are in *Image attachments* below.
 
 ## Phase 0 results (2026-08-04, live SCFH)
 
@@ -516,6 +520,64 @@ Findings beyond the raw numbers:
   average ~1,100 chars, far longer than a block, so records/s understates it; scaling
   SCFH's Phase 1 build (~1.9 M chars in ~100 s) puts 11.3 M chars on the order of ten
   minutes.
+
+## Image attachments (Phase 6 plan, 2026-11-14)
+
+The index holds no text from attached images. An image embeds as `![alt](<url>)`, and
+normalize keeps only the alt text, so an image with empty alt text — the common case —
+leaves its block with no text and no record; a bare Firebase URL in a block is indexed
+as the URL string itself. No image file is fetched, and Phase 5's OCR runs on PDF pages
+only.
+
+### Measured (2026-11-14, live hippo and SCFH)
+
+Every file was fetched decrypted into memory and discarded; only counts were kept.
+
+| Measurement | Result |
+|---|---|
+| SVG uploads | hippo none; SCFH 9 distinct, in 10 blocks — 8 image embeds with empty alt text (no record today), 2 bare URLs (indexed as URL text) |
+| SVG fetches | 8 of 9; the ninth failed in Roam (`file.get` 500, "Failed to fetch") |
+| SVG structure | all 8 carry real `<text>` elements (4–52 each, some with `<tspan>`), most a `<title>` and `<desc>`; none outline their text, none use `<foreignObject>` |
+| SVG text | 184–2,937 chars each, ~10,000 in all; 5–23 KB per file |
+| Raster images embedded | hippo 1,354 (742 JPEG, 357 PNG, 246 JPG, 9 other); SCFH 352 (146 JPEG, 104 JPG, 91 PNG, 11 other) |
+
+### Design (6a — SVG text)
+
+- **Discover.** Any Firebase Storage URL in a block whose object path ends `.svg` or
+  `.svg.enc` — as an image embed or bare. Fetched like a PDF (decrypting `file.get`,
+  in memory only), under the same `PdfFetchBudget`.
+- **Cache.** The PDF text cache becomes an attachment text cache: schema v3, migrated
+  in place, adds a `media` column (`pdf` / `svg`); the file keeps its name.
+- **Extract.** Parse the XML with the standard library (`xml.etree.ElementTree`; it
+  resolves no external entities, and the expat bundled with Python 3.14 guards against
+  entity-expansion bombs). Collect, in document order, the text of `<title>`, `<desc>`,
+  `<text>` (with its `<tspan>` / `<textPath>`), and `<foreignObject>` — the last for
+  Mermaid and draw.io exports, which put labels there — skipping `<style>`, `<script>`,
+  and `<metadata>`. Cleaned like a PDF page and kept as a one-page document; no text is
+  `no-text`, unparseable XML `parse-failed`. Outlined-text SVGs would need rasterizing
+  for OCR; none of SCFH's do, so that stays out of scope.
+- **Records.** A new `RecordKind.IMAGE` ("image") with record ids
+  `<uid>/img/<key8>/1.<chunk>`; embed input is the host block's breadcrumb, then
+  `SVG "<upload name>"`, then the text. Search collapses to one hit per image, as per PDF.
+- **Hit fields.** Hits gain a general `attachment_name` (and `attachment_page`, PDFs
+  only); `pdf_name` / `pdf_page` stay as duplicates so no consumer breaks.
+- **Bare URLs.** Normalize strips bare Firebase Storage URLs from block text, so the two
+  URL-only blocks stop embedding a URL string — and an access token stops reaching the
+  index's text.
+- **Cost.** Nine fetches (~60 KB) and about ten records — within the interactive budget.
+
+### Sub-phases
+
+- **6a — SVG text.** As designed above; tests over fixture SVGs (plain `<text>`,
+  `<tspan>`, `<foreignObject>`, no text, malformed); live on SCFH.
+- **6b — measure raster OCR.** A sample of ~50 images per graph: how many carry
+  readable text, bytes per image, OCR time. Photos often carry none, and hippo's 1,354
+  images could be gigabytes through `file.get` (the 5b crash risk).
+- **6c — raster OCR, only if 6b justifies it.** Reuse `ocr.py`'s Vision path on the
+  image itself, with a recognition-confidence threshold so photos do not index junk,
+  under the existing byte budgets.
+
+6a stands on its own: if raster images are not worth it, 6b and 6c are skipped.
 
 ## Open questions
 
