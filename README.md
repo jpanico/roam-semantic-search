@@ -45,6 +45,10 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
   objects — as an `image` record in its block's context; no OCR is involved. A bare
   Firebase Storage URL is stripped from block text, since it is never prose and it
   carries an access token.
+- **Attached photos and screenshots** — a raster image upload (PNG, JPEG, WebP, GIF,
+  HEIC, AVIF, TIFF) is read by on-device OCR, and its text kept only when Vision is
+  confident and at least half its words are real words: most photos carry none, and
+  Vision reads confident nonsense into textures. Kept text becomes an `image` record.
 - **Embed** — a local [Ollama](https://ollama.com) server running
   `nomic-embed-text` (768-dim), with the model's `search_document:` /
   `search_query:` retrieval prefixes. Loopback-only, enforced.
@@ -147,10 +151,12 @@ roam-semantic-search stats --graph scfh           # store provenance: model, cou
 `--port` and `--token` are needed only to override the registry, or to reach a graph it
 does not know about.
 
-### PDF and SVG attachments: `extract-pdfs`
+### PDF and image attachments: `extract-pdfs`
 
-SVG uploads go through the same path as PDFs — fetched, cached, and indexed alongside
-them — but their text is read straight from the XML, so they need no OCR.
+SVG and raster image uploads go through the same path as PDFs — fetched, cached, and
+indexed alongside them. An SVG's text is read straight from its XML; a raster image's is
+read by OCR, so a raster image is fetched only by a run with OCR on (the CLI's default),
+never by the MCP server's refreshes.
 
 `build` and `refresh` index attached PDFs (`--no-pdfs` leaves them out): each first
 fetches the PDFs its text cache lacks, within a budget, then indexes the cached text.
@@ -169,7 +175,9 @@ the rest for the next refresh (page and block edits are never held back). Each P
 `parse-failed`, or `fetch-failed`. A password-protected PDF is never refetched — an upload
 never changes — while `--retry-failed` refetches the two failure kinds. Five fetch failures
 in a row abort the run without caching them: at that point the graph, not its files, is
-failing. Like `refresh`, it takes `--require-open-window`.
+failing. No fetch waits more than 120 s for Roam Desktop's answer — left alone, Roam holds a
+file it cannot download for an hour — and one that times out is recorded as `fetch-failed`.
+Like `refresh`, it takes `--require-open-window`.
 
 **Scanned pages are read by OCR.** A page with no text layer is rendered in memory and
 read by macOS Vision, on-device — nothing leaves the machine, and no image is written to
@@ -250,13 +258,15 @@ client, with four tools:
 | `index_stats` | One store's provenance |
 
 A hit's `kind` is `page`, `block`, `pdf`, or `image`. A `pdf` hit is a passage of an
-attached PDF and an `image` hit is text read from an attached SVG: its `uid` is the block
+attached PDF and an `image` hit is text read from an attached image (an SVG's XML, or a
+photo or screenshot by OCR): its `uid` is the block
 that carries the attachment, `attachment_name` names it, and `attachment_page` gives a
 PDF's page (`pdf_name` / `pdf_page` repeat them for PDF hits). Each attachment appears at
 most once, as its best-matching passage.
 
 Every refresh the server runs carries a small PDF budget — 10 PDFs, 50 MB, 15 s, and 250
-passage embeddings — and its summary reports `pdf_pending_count` and
+passage embeddings; the 15 s also bounds the wait on any one fetch, and a fetch it cuts
+off is left for the next refresh — and its summary reports `pdf_pending_count` and
 `embed_deferred_count`, the PDF work left for later (also in a search's `refresh.summary`).
 
 **Staleness is bounded, and never silent.** `semantic_search` answers from the index — a

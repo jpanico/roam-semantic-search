@@ -1,8 +1,11 @@
 """Attachment text: find a graph's PDF and SVG attachments, extract their text, and cache it.
 
-SVGs (Phase 6a) share the PDF pipeline end to end — discovery, the decrypting fetch, the
-budget, and the cache — and differ only in extraction: an SVG's words are in its XML
-(:func:`extracted_svg_text`), so it needs no OCR, and it is kept as a one-page document.
+SVGs (Phase 6a) and raster images (6c) share the PDF pipeline end to end — discovery, the
+decrypting fetch, the budget, and the cache — and differ only in extraction, each kept as
+a one-page document.  An SVG's words are in its XML (:func:`extracted_svg_text`), so it
+needs no OCR.  A raster image's are not (:func:`extracted_raster_text`): it is read by
+on-device OCR, so it is fetched only by a run with OCR on, and the OCR keeps only
+confident, word-like text, since most photos carry none.
 The module and its cache file keep their PDF-era names.
 
 A PDF sits in a block as ``{{pdf: <url>}}`` or ``{{[[pdf]]: <url>}}``; the full-graph pull
@@ -34,10 +37,13 @@ Public symbols:
 - :data:`EXTRACTOR_VERSION` — the extraction logic's version; a bump re-extracts.
 - :data:`NO_TEXT_PAGE_MIN_CHARS` — the non-whitespace chars a page needs to count as text.
 - :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` — failed fetches in a row that abort a run.
+- :data:`FETCH_TIMEOUT_SECONDS` — the longest one fetch waits for Roam Desktop's answer.
 - :func:`default_pdf_cache_path` — the conventional cache location for a graph.
 - :func:`pdf_embeds` — pull-block rows → every PDF embed, in row order.
 - :func:`svg_embeds` — pull-block rows → every SVG upload a block names, in row order.
+- :func:`raster_embeds` — pull-block rows → every raster image upload a block names, in row order.
 - :func:`extracted_svg_text` — SVG bytes → status and text, read from the XML.
+- :func:`extracted_raster_text` — image bytes → status and text, read by OCR.
 - :func:`url_key` — the cache key of a PDF URL.
 - :func:`extracted_text` — PDF bytes → status, per-page text, error.
 - :func:`cached_pdf_texts` — every cached extraction result by URL key.
@@ -70,7 +76,7 @@ from guffin.roam.graph_source import GraphSource
 from guffin.roam.markdown import FIREBASE_STORAGE_URL_RE, PDF_EMBED_RE
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, validate_call
 
-from roam_semantic_search.ocr import OCR_VERSION, ocr_available, recognized_page_text
+from roam_semantic_search.ocr import OCR_VERSION, ocr_available, readable_image_text, recognized_page_text
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +88,14 @@ NO_TEXT_PAGE_MIN_CHARS: Final[int] = 20
 
 CONSECUTIVE_FETCH_FAILURE_LIMIT: Final[int] = 5
 """Failed fetches in a row that abort a run: the graph itself, not the files, is failing."""
+
+FETCH_TIMEOUT_SECONDS: Final[float] = 120.0
+"""The longest one fetch waits for Roam Desktop's answer before it is recorded as failed.
+
+Roam holds a ``file.get`` it cannot finish for an hour before answering "Response timeout"
+(one did, in 6c's SCFH run).  The slowest fetch seen, a 118 MB PDF, answered within ~27 s
+(design plan, 6c), so 120 s leaves room without letting one stuck asset stall a run.
+"""
 
 _CACHE_SCHEMA_VERSION: Final[int] = 3
 _CACHE_FILE_MODE: Final[int] = 0o600
@@ -127,12 +141,27 @@ _SVG_SKIPPED_TAGS: Final[frozenset[str]] = frozenset({"style", "script", "metada
 
 _SVG_SUFFIXES: Final[tuple[str, ...]] = (".svg", ".svg.enc")
 
+_RASTER_EXTENSIONS: Final[tuple[str, ...]] = (
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".heic",
+    ".avif",
+    ".tif",
+    ".tiff",
+)
+_RASTER_SUFFIXES: Final[tuple[str, ...]] = (*_RASTER_EXTENSIONS, *(f"{ext}.enc" for ext in _RASTER_EXTENSIONS))
+
 
 class Media(enum.StrEnum):
     """What kind of attachment an embed or cache entry is."""
 
     PDF = "pdf"
     SVG = "svg"
+    RASTER = "raster"
+    """A raster image — PNG, JPEG, WebP, GIF, HEIC, AVIF, or TIFF — read by OCR."""
 
 
 class PdfEmbed(BaseModel):
@@ -222,7 +251,9 @@ class PdfFetchBudget(BaseModel):
     """How much one run may fetch through Roam Desktop; ``None`` leaves a bound off.
 
     A run checks the budget before each fetch and stops once any bound is reached, so the
-    fetch that crosses the byte or time bound completes.  Bytes matter as well as counts:
+    fetch that crosses the byte bound completes.  The time bound also caps how long a fetch
+    waits for Roam (:meth:`fetch_timeout`): one still unanswered when it arrives is
+    abandoned and left pending for the next run.  Bytes matter as well as counts:
     every PDF crosses Roam Desktop's main process as one base64 string, and a run moving
     ~1.3 GB through a long-lived Roam process crashed it (design plan, 5b).
 
@@ -245,6 +276,19 @@ class PdfFetchBudget(BaseModel):
             or (self.max_bytes is not None and fetched_bytes >= self.max_bytes)
             or (self.max_seconds is not None and elapsed_seconds >= self.max_seconds)
         )
+
+    def fetch_timeout(self, elapsed_seconds: float) -> float:
+        """How long the next fetch may wait: :data:`FETCH_TIMEOUT_SECONDS`, or the time left if less.
+
+        Args:
+            elapsed_seconds: How long the run has spent so far; the budget is not exhausted.
+
+        Returns:
+            The fetch's timeout in seconds, always positive.
+        """
+        if self.max_seconds is None:
+            return FETCH_TIMEOUT_SECONDS
+        return min(FETCH_TIMEOUT_SECONDS, self.max_seconds - elapsed_seconds)
 
 
 class ExtractionSummary(BaseModel):
@@ -329,6 +373,31 @@ def svg_embeds(rows: Sequence[dict[str, object]]) -> list[PdfEmbed]:
             PdfEmbed(host_uid=uid, url=match.group(0), media=Media.SVG)
             for match in FIREBASE_STORAGE_URL_RE.finditer(string)
             if match.group("object_path").lower().endswith(_SVG_SUFFIXES)
+        )
+    return embeds
+
+
+@validate_call
+def raster_embeds(rows: Sequence[dict[str, object]]) -> list[PdfEmbed]:
+    """Every raster image upload the graph's blocks name, in row order — embedded or bare.
+
+    Args:
+        rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
+
+    Returns:
+        One :class:`PdfEmbed` (media RASTER) per Firebase Storage URL whose object path
+        ends in a raster image extension (``.enc`` allowed).
+    """
+    embeds: Final[list[PdfEmbed]] = []
+    for row in rows:
+        string: object = row.get("string")
+        uid: object = row.get("uid")
+        if not isinstance(string, str) or not isinstance(uid, str) or "firebasestorage" not in string:
+            continue
+        embeds.extend(
+            PdfEmbed(host_uid=uid, url=match.group(0), media=Media.RASTER)
+            for match in FIREBASE_STORAGE_URL_RE.finditer(string)
+            if match.group("object_path").lower().endswith(_RASTER_SUFFIXES)
         )
     return embeds
 
@@ -431,6 +500,21 @@ def extracted_svg_text(contents: bytes) -> ExtractedText:
         return ExtractedText(PdfStatus.PARSE_FAILED, (), str(error)[:_ERROR_MAX_CHARS])
     text: Final[str] = _readable(_clean_page_text("\n".join(_svg_text_pieces(root))))
     return ExtractedText(PdfStatus.OK if text else PdfStatus.NO_TEXT, (text,), None)
+
+
+@validate_call
+def extracted_raster_text(contents: bytes) -> ExtractedText:
+    """Read a raster image's text by on-device OCR, keeping only confident, word-like text.
+
+    Args:
+        contents: The image's (decrypted) bytes.
+
+    Returns:
+        One cleaned "page": OK with the text OCR kept (``ocr_page_count`` 1) when it has at
+        least :data:`NO_TEXT_PAGE_MIN_CHARS` non-whitespace chars, else NO_TEXT.
+    """
+    text: Final[str] = _readable(_clean_page_text(readable_image_text(contents)))
+    return ExtractedText(PdfStatus.OK if text else PdfStatus.NO_TEXT, (text,), None, 1 if text else 0)
 
 
 def _connected_cache(cache_path: Path) -> sqlite3.Connection:
@@ -543,13 +627,23 @@ def _needs_ocr(entry: PdfText) -> bool:
     return entry.media is Media.PDF and "" in entry.page_texts and entry.ocr_version < OCR_VERSION
 
 
-def _needs_extraction(entry: PdfText | None, retry_failed: bool, ocr: bool) -> bool:
+def _needs_extraction(entry: PdfText | None, retry_failed: bool, ocr: bool, media: Media) -> bool:
     """Whether a URL's cached entry (or its absence) calls for a fetch this run.
 
     An upload never changes, so only a missing entry, a newer extractor, an explicit retry
     of a failure, or — in a run that OCRs — blank pages no current OCR has read bring a URL
-    back; a password-protected PDF never comes back.
+    back; a password-protected PDF never comes back.  A raster image is read only by OCR,
+    so a run without OCR never fetches one, and a run with it refetches one only when the
+    OCR itself is newer.
     """
+    if media is Media.RASTER:
+        if not ocr:
+            return False
+        if entry is None:
+            return True
+        if entry.status in (PdfStatus.FETCH_FAILED, PdfStatus.PARSE_FAILED):
+            return retry_failed
+        return entry.extractor_version < EXTRACTOR_VERSION or entry.ocr_version < OCR_VERSION
     if entry is None:
         return True
     match entry.status:
@@ -568,25 +662,33 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _fetched_entry(source: GraphSource, url: str, ocr: bool, media: Media) -> PdfText:
+def _failed_entry(error: str, media: Media) -> PdfText:
+    """The cache entry of an attachment whose fetch failed, with *error* as its reason."""
+    return PdfText(
+        status=PdfStatus.FETCH_FAILED,
+        extractor_version=EXTRACTOR_VERSION,
+        error=error[:_ERROR_MAX_CHARS],
+        extracted_at=_now(),
+        media=media,
+    )
+
+
+def _fetched_entry(source: GraphSource, url: str, ocr: bool, media: Media, timeout: float) -> PdfText:
     """Fetch one attachment into memory, extract it, and return its cache entry (bytes discarded).
 
     A Local API error answering for this file (an HTTP error status, or a malformed
     response) yields a :attr:`PdfStatus.FETCH_FAILED` entry; anything else — the Local API
-    unreachable, say — propagates.
+    unreachable, or no answer within *timeout* seconds (``requests.exceptions.Timeout``) —
+    propagates.
     """
     try:
-        asset: Final[RoamAsset] = source.fetch_file(HttpUrl(url))
+        asset: Final[RoamAsset] = source.fetch_file(HttpUrl(url), timeout=timeout)
     except (requests.exceptions.HTTPError, ValidationError) as error:
-        return PdfText(
-            status=PdfStatus.FETCH_FAILED,
-            extractor_version=EXTRACTOR_VERSION,
-            error=f"{type(error).__name__}: {error}"[:_ERROR_MAX_CHARS],
-            extracted_at=_now(),
-            media=media,
-        )
+        return _failed_entry(f"{type(error).__name__}: {error}", media)
     extraction: Final[ExtractedText] = (
-        extracted_svg_text(asset.contents) if media is Media.SVG else extracted_text(asset.contents, ocr=ocr)
+        extracted_svg_text(asset.contents)
+        if media is Media.SVG
+        else extracted_raster_text(asset.contents) if media is Media.RASTER else extracted_text(asset.contents, ocr=ocr)
     )
     return PdfText(
         status=extraction.status,
@@ -596,7 +698,7 @@ def _fetched_entry(source: GraphSource, url: str, ocr: bool, media: Media) -> Pd
         page_texts=extraction.page_texts,
         error=extraction.error,
         extracted_at=_now(),
-        ocr_version=OCR_VERSION if ocr and media is Media.PDF else 0,
+        ocr_version=OCR_VERSION if ocr and media is not Media.SVG else 0,
         ocr_page_count=extraction.ocr_page_count,
         media=media,
     )
@@ -618,6 +720,10 @@ def extract_pdf_texts(
     when its fetch or parse failed; a password-protected PDF is never refetched.  Every
     result is committed as soon as it lands, so an interrupted run keeps its progress, and
     a *budget* stops the run early, leaving the rest pending for the next one.
+
+    No fetch waits on Roam Desktop longer than :data:`FETCH_TIMEOUT_SECONDS`; one that does
+    is recorded as failed.  A budget's time bound can cut that wait shorter, and a fetch it
+    cuts off stops the run with that attachment left pending rather than failed.
 
     A run of :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` failed fetches in a row means the graph
     itself is failing (closed, or locked mid-run), not its files: the run aborts *without*
@@ -655,16 +761,29 @@ def extract_pdf_texts(
     try:
         cached: Final[dict[str, PdfText]] = _read_entries(connection)
         due: Final[list[str]] = [
-            url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed, run_ocr)
+            url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed, run_ocr, media_by_url[url])
         ]
         logger.info("%d distinct attachments; %d need extraction", len(urls), len(due))
         outcomes: Final[Counter[PdfStatus]] = Counter()
         failure_run: Final[list[tuple[str, PdfText]]] = []
         for url in due:
-            if bounds.exhausted(fetched, fetched_bytes, time.monotonic() - started):
+            elapsed: float = time.monotonic() - started
+            if bounds.exhausted(fetched, fetched_bytes, elapsed):
                 logger.info("fetch budget reached after %d PDFs (%d bytes)", fetched, fetched_bytes)
                 break
-            entry: PdfText = _fetched_entry(source, url, run_ocr, media_by_url[url])
+            timeout: float = bounds.fetch_timeout(elapsed)
+            try:
+                entry: PdfText = _fetched_entry(source, url, run_ocr, media_by_url[url], timeout)
+            except requests.exceptions.Timeout:
+                if timeout < FETCH_TIMEOUT_SECONDS:
+                    logger.info(
+                        "fetch budget's time ran out waiting on a fetch, after %d PDFs (%d bytes)",
+                        fetched,
+                        fetched_bytes,
+                    )
+                    break
+                logger.warning("no answer from Roam Desktop within %.0f s; recording the fetch as failed", timeout)
+                entry = _failed_entry(f"Timeout: no answer from Roam Desktop within {timeout:.0f} s", media_by_url[url])
             fetched += 1
             fetched_bytes += entry.byte_count or 0
             ocr_pages += entry.ocr_page_count

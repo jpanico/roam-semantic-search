@@ -388,3 +388,31 @@ class TestBareStorageUrls:
             _block_row(2, "blk000001", _SVG_URL, 1, [1]),
         ]
         assert [record.uid for record in normalized_records(rows)] == ["page00001"]
+
+
+_JPEG_URL: Final[str] = (
+    "https://firebasestorage.googleapis.com/v0/b/test.appspot.com/o/imgs%2Fapp%2Ftest%2FPp4Ss.jpeg.enc"
+    "?alt=media&token=abc123"
+)
+
+
+class TestRasterImageRecords:
+    def test_a_raster_image_yields_an_image_record_labelled_image(self) -> None:
+        rows: Final[list[dict[str, object]]] = [
+            _page_row(1, "page00001", "Garden"),
+            _block_row(2, "blk000001", f"receipt ![]({_JPEG_URL})", 1, [1]),
+        ]
+        text: Final[PdfText] = PdfText(
+            status=PdfStatus.OK,
+            extractor_version=1,
+            upload_name="IMG_2041.jpeg",
+            page_texts=("Receipt for the garden shed paint",),
+            extracted_at="2026-11-14T00:00:00+00:00",
+            media=Media.RASTER,
+        )
+        records: Final[list[IndexRecord]] = attachment_records(rows, {url_key(_JPEG_URL): text})
+        assert [(record.kind, record.breadcrumb) for record in records] == [
+            (RecordKind.IMAGE, 'Garden › receipt › Image "IMG_2041.jpeg"')
+        ]
+        assert records[0].record_id.startswith("blk000001/img/")
+        assert [embed.media for embed in indexable_attachment_embeds(rows)] == [Media.RASTER]

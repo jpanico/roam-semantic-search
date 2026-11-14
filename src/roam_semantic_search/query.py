@@ -53,7 +53,7 @@ class SearchHit(BaseModel):
         text: The hit's plain text (for a PDF chunk, the matching passage).
         is_page: Whether the hit is a page rather than a block.
         kind: What the hit is: ``page``, ``block``, ``pdf`` (a passage of an attached PDF), or
-            ``image`` (text read from an attached image — today an SVG's).
+            ``image`` (text read from an attached image — an SVG's, or a raster image's by OCR).
         attachment_name: For a ``pdf`` or ``image`` hit, the name the attachment was
             uploaded under, when known.
         attachment_page: For a ``pdf`` hit, the 1-based page the passage is on.

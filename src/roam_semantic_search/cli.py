@@ -5,7 +5,7 @@ Commands:
 - ``graphs`` — list the graphs connected on this machine and which of them are indexed.
 - ``build`` — fetch the graph, normalize, embed locally, and (re)write the index store.
 - ``refresh`` — incrementally update the store: re-embed only changed records, delete vanished ones.
-- ``extract-pdfs`` — fetch the graph's attached PDFs and SVGs and cache their text, for indexing.
+- ``extract-pdfs`` — fetch the graph's attached PDFs and images and cache their text, for indexing.
 - ``search`` — answer a natural-language query from the store.
 - ``stats`` — print the store's provenance and embedding-model facts.
 
@@ -58,6 +58,7 @@ from roam_semantic_search.pdf_text import (
     default_pdf_cache_path,
     extract_pdf_texts,
     pdf_embeds,
+    raster_embeds,
     svg_embeds,
 )
 from roam_semantic_search.query import SearchHit, search_store
@@ -387,7 +388,7 @@ def extract_pdfs(
     ocr: OcrOption = True,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
-    """Fetch the graph's attached PDFs and SVGs and cache their text, for indexing.
+    """Fetch the graph's attached PDFs and images and cache their text, for indexing.
 
     Every PDF a block embeds is fetched decrypted through the Roam Local API, held in memory
     only, and its text layer cached page by page in an owner-only file; already-cached PDFs
@@ -401,7 +402,7 @@ def extract_pdfs(
     resolved_cache: Final[Path] = _pdf_cache_path(graph, pdf_cache_path)
     started: Final[float] = time.perf_counter()
     rows: Final[list[dict[str, object]]] = fetch_graph(api_endpoint)
-    embeds: Final[list[PdfEmbed]] = [*pdf_embeds(rows), *svg_embeds(rows)]
+    embeds: Final[list[PdfEmbed]] = [*pdf_embeds(rows), *svg_embeds(rows), *raster_embeds(rows)]
     try:
         summary: Final[ExtractionSummary] = extract_pdf_texts(
             resolved_cache,

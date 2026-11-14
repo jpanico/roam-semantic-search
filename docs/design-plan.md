@@ -267,8 +267,8 @@ roam-semantic-search/
   DONE 2026-11-14.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
-- **Phase 6 — image attachment text: PLANNED 2026-11-14; 6a (SVG text) DONE
-  2026-11-14.** Index the text inside
+- **Phase 6 — image attachment text: PLANNED 2026-11-14; 6a (SVG text), 6b (raster
+  measurement), and 6c (raster OCR) DONE 2026-11-14.** Index the text inside
   attached images: SVGs first (6a — their text is in the XML, no OCR needed), then,
   only if a measurement justifies it, raster images by OCR (6b measure, 6c build).
   Measurements, design, and sub-phases are in *Image attachments* below.
@@ -582,12 +582,80 @@ Every file was fetched decrypted into memory and discarded; only counts were kep
   Firebase URL. hippo's refresh removed 103 such blocks. Queries about the
   stored-program-computer diagram and the programmer–AI triangle found the SVGs' own
   text, as `image` hits on the blocks that carry them.
-- **6b — measure raster OCR.** A sample of ~50 images per graph: how many carry
-  readable text, bytes per image, OCR time. Photos often carry none, and hippo's 1,354
-  images could be gigabytes through `file.get` (the 5b crash risk).
+- **6b — measure raster OCR: DONE 2026-11-14** (results below). A sample of ~50 images
+  per graph: how many carry readable text, bytes per image, OCR time. Photos often carry
+  none, and hippo's 1,354 images could be gigabytes through `file.get` (the 5b crash
+  risk).
 - **6c — raster OCR, only if 6b justifies it.** Reuse `ocr.py`'s Vision path on the
   image itself, with a recognition-confidence threshold so photos do not index junk,
-  under the existing byte budgets.
+  under the existing byte budgets. *6b justifies it for hippo* (below); the junk filter
+  must be word-likeness, not confidence alone. *DONE 2026-11-14, as built:*
+  `pdf_text.raster_embeds` finds any Firebase upload with a raster extension (PNG, JPEG,
+  WebP, GIF, HEIC, AVIF, TIFF; embedded, linked, or bare) as `Media.RASTER`;
+  `ocr.readable_image_text` runs Vision on the image's own bytes, drops lines below
+  confidence 0.5, and keeps the rest only when `word_likeness` — the share of 3+-letter
+  tokens in `/usr/share/dict/words` — reaches 0.5 (that list, web2, lacks many inflected
+  forms, so it understates real text; 6b calibrated the 0.5 against it). A raster image
+  is fetched only by a run with OCR on — the CLI's default, never the MCP server's —
+  and comes back only for a newer `OCR_VERSION`; its text is an `image` record labelled
+  `Image "<upload name>"`. *Live, after a Roam relaunch:* hippo's 1,355 raster uploads
+  took two budgeted runs (500 MB + 352 MB, 735 s + 494 s): 798 carry readable text, 556
+  none, and one `fetch-failed` ("Unable to get file metadata") — against 6b's projection
+  of ~680 worded images, ~0.87 GB, and ~22 min. SCFH's 353 (183 MB): 73 with text, 279
+  none, one failed. That failure is the run's lesson: one `file.get` hung for 3,600 s
+  until Roam answered "Response timeout", so SCFH's run took 64 min where its other 352
+  images took about 4. The fetch budget's `max_seconds` is checked only between fetches,
+  and guffin's `invoke_action` set no client timeout, so a stuck fetch was bounded only by
+  Roam's hour (fixed the same day: decision log, "Every fetch has a timeout"). Roam
+  Desktop stayed up through ~1.04 GB of `file.get`. The refreshes
+  embedded 906 image records for hippo (41 s; long screenshots chunk) and 78 for SCFH
+  (4 s). The junk filter held: of the 871 images kept, about 20 carry two or fewer
+  dictionary words, and nearly all of those are real labels — part numbers,
+  measurements, a product name, "Shoggoth (Artificial Intelligence)"; outright noise
+  (a Midjourney hedge maze read as `all/c1 Hlel008 …`) is a case or two, so the gate
+  stays as built rather than costing the short labels. Searches found what only the
+  pixels held: "MacBook Air 15-inch" ranked four screenshots and photos of About-This-Mac
+  and order pages first through fourth; "health care proxy and living trust paperwork"
+  ranked a photo of a labelled folder second, between two scanned PDFs; and on SCFH a
+  screenshot's caption ranked second for "shoggoth monster meme about AI".
+
+### Phase 6b results (2026-11-14, live hippo and SCFH)
+
+Spike script: `spike/phase6b_image_ocr_measure.py` (project venv; resumable; in-memory
+fetches; Vision on the image bytes, no rendering; `--assume-open` skips the window-list
+check, which lagged SCFH). An evenly spaced sample of 50 embedded raster images per
+graph. An image "has words" when Vision recognizes at least 20 non-whitespace chars at
+confidence ≥ 0.5 *and* at least half of its alphabetic tokens (3+ letters) are in the
+system word list (`/usr/share/dict/words`); text failing only the second test is
+"noise".
+
+| Measurement | hippo (1,354 images) | SCFH (352 images) |
+|---|---|---|
+| Words / noise / no text | 25 / 2 / 23 (50% / 4% / 46%) | 8 / 5 / 37 (16% / 10% / 74%) |
+| Text in a "words" image | median 975 chars (p10 59), word-likeness 0.77 | median 68 chars (p10 39), word-likeness 0.79 |
+| Size | median 0.32 MB, p90 1.68, max 3.60 | median 0.23 MB, p90 0.83, max 1.86 |
+| Fetch / OCR | median 0.60 s / 0.20 s | median 0.55 s / 0.09 s |
+| Whole graph, projected | ~0.87 GB, ~22 min, ~680 images with words | ~0.12 GB, ~4 min, ~56 images with words |
+
+No fetch or OCR failed in either sample.
+
+Findings:
+
+- **hippo justifies 6c; SCFH comes along cheaply.** Half of hippo's images are
+  screenshots and scanned documents carrying page-length text (median ~1,000 chars) —
+  roughly 680 images now unfindable but by their surroundings. SCFH's are mostly the
+  book's illustrations; its ~56 worded images carry short labels, but at 0.12 GB and four
+  minutes there is no reason to exclude them.
+- **Confidence does not separate noise; word-likeness does.** Noise images reached
+  mean confidence 0.6–1.0 — Vision is confidently wrong on textures and scenes — but
+  their word-likeness was 0.0–0.4, against 0.5–0.9 for real text. 6c should gate on
+  word-likeness (with a confidence floor per line), which on macOS can use the same
+  system word list.
+- **Cost is fetch, not OCR.** Vision on the raw bytes takes a fraction of a second
+  (median 0.1–0.2 s), so a full pass is the ~1 GB of fetches — two 500 MB budgeted runs.
+- **Mind the per-process crash risk.** This Roam Desktop process has moved ~1.5–2 GB
+  since its relaunch; another ~1 GB approaches the ~2.8 GB at which the 5b run crashed
+  it. Relaunch Roam before 6c's bulk pass.
 
 6a stands on its own: if raster images are not worth it, 6b and 6c are skipped.
 
@@ -605,6 +673,20 @@ Every file was fetched decrypted into memory and discarded; only counts were kep
 
 ## Decision log
 
+- **2026-11-14 — Every fetch has a timeout.** In 6c's SCFH run one `file.get` went
+  unanswered for 3,600 s, until Roam Desktop gave up with "Response timeout": guffin's
+  `invoke_action` posted with no client timeout, and the fetch budget's `max_seconds` was
+  checked only between fetches, so neither bounded a stuck fetch — an MCP refresh's "15 s"
+  included. guffin's `invoke_action` and `GraphSource.fetch_file` now take a `timeout`
+  (default `None`, the old behavior; the snapshot replay source ignores it), and every
+  attachment fetch passes `FETCH_TIMEOUT_SECONDS` = 120 — over four times the slowest fetch
+  seen, a 118 MB PDF at ~27 s — or the budget's time left if that is less
+  (`PdfFetchBudget.fetch_timeout`). A fetch that outwaits the full 120 s is cached as
+  `fetch-failed` (refetched by `--retry-failed`) and counts toward the five-in-a-row abort;
+  one the budget cuts short stops the run with that attachment left pending, not failed, so
+  a large PDF the 15 s interactive budget cannot fetch waits for a CLI run rather than
+  being written off. Roam may still be working on a request the client abandoned; whether
+  that slows the requests after it is not yet observed.
 - **2026-11-14 — A server refuses to serve once its code changes.** A running MCP server
   keeps the code it started with, and the Claude app keeps reporting it healthy (✓, no
   Reconnect in `/mcp`). After 5c changed the store schema, the app's still-running copies

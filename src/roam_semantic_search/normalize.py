@@ -41,7 +41,16 @@ from guffin.roam.markdown import FIREBASE_STORAGE_URL_RE
 from pydantic import BaseModel, ConfigDict, validate_call
 
 from roam_semantic_search.json_narrowing import is_json_list, is_json_object
-from roam_semantic_search.pdf_text import Media, PdfEmbed, PdfStatus, PdfText, pdf_embeds, svg_embeds, url_key
+from roam_semantic_search.pdf_text import (
+    Media,
+    PdfEmbed,
+    PdfStatus,
+    PdfText,
+    pdf_embeds,
+    raster_embeds,
+    svg_embeds,
+    url_key,
+)
 
 SKIPPED_PAGE_PREFIXES: Final[tuple[str, ...]] = ("roam/",)
 """Page-title prefixes whose pages (and all their blocks) are excluded from the index."""
@@ -62,6 +71,9 @@ PDF_CHUNK_OVERLAP_CHARS: Final[int] = 200
 """How much of a split page's text consecutive chunks share, so no passage is cut in two."""
 
 _PDF_KEY_CHARS: Final[int] = 8
+
+_MEDIA_LABELS: Final[dict[Media, str]] = {Media.PDF: "PDF", Media.SVG: "SVG", Media.RASTER: "Image"}
+"""How an attachment's breadcrumb segment names its kind: ``PDF "<name>"``, ``Image "<name>"``."""
 
 _DAILY_NOTE_UID_RE: Final[regex.Pattern[str]] = regex.compile(rf"^{DAILY_NOTE_UID_PATTERN}$")
 
@@ -94,7 +106,7 @@ class RecordKind(enum.StrEnum):
     """One chunk of a page of a PDF a block embeds."""
 
     IMAGE = "image"
-    """One chunk of the text of an image a block names (an SVG's, read from its XML)."""
+    """One chunk of the text of an image a block names: an SVG's, from its XML, or a raster image's, by OCR."""
 
 
 class PdfLocator(BaseModel):
@@ -597,7 +609,7 @@ def indexable_attachment_embeds(rows: Sequence[dict[str, object]], include_daily
         include_daily_notes: Whether daily-note pages count as indexable.
 
     Returns:
-        The embeds, in row order: each block's PDFs, then its SVGs.
+        The embeds, in row order: each block's PDFs, then its SVGs, then its raster images.
     """
     indexable_page_dbids: Final[set[int]] = _indexable_page_dbids(rows, include_daily_notes)
     hosts: Final[list[dict[str, object]]] = [
@@ -607,7 +619,7 @@ def indexable_attachment_embeds(rows: Sequence[dict[str, object]], include_daily
         and (page_id := _stub_id(row, "page")) is not None
         and page_id in indexable_page_dbids
     ]
-    return [embed for host in hosts for embed in (*pdf_embeds([host]), *svg_embeds([host]))]
+    return [embed for host in hosts for embed in (*pdf_embeds([host]), *svg_embeds([host]), *raster_embeds([host]))]
 
 
 @validate_call
@@ -619,9 +631,9 @@ def attachment_records(
     """Derive one index record per chunk of every cached attachment the graph's blocks carry.
 
     A block on an indexable page that embeds a PDF (``{{pdf: <url>}}`` / ``{{[[pdf]]: <url>}}``)
-    or names an SVG upload, whose cached extraction is
+    or names an SVG or raster image upload, whose cached extraction is
     :attr:`~roam_semantic_search.pdf_text.PdfStatus.OK`, yields a record for each chunk of
-    each page with text (:func:`_chunked`) — a PDF chunk, or for an SVG an image record.  A
+    each page with text (:func:`_chunked`) — a PDF chunk, or for an image an image record.  A
     record carries the host block's uid, so a hit is one ``((uid))`` away from the
     attachment in its live context; its breadcrumb is the block's context path, its own
     text, and the attachment's upload name, and that context leads its embed input ahead
@@ -651,7 +663,7 @@ def attachment_records(
     for row in rows:
         raw: str | None = _str_field(row, "string")
         uid: str | None = _str_field(row, "uid")
-        if raw is None or uid is None or ("pdf" not in raw and ".svg" not in raw.lower()):
+        if raw is None or uid is None or "firebasestorage" not in raw:
             continue
         page_id: int | None = _stub_id(row, "page")
         if page_id is None or page_id not in indexable_page_dbids:
@@ -662,7 +674,7 @@ def attachment_records(
         if own_text:
             context = f"{context} › {own_text}"
         edited_at: int = max(_int_field(row, "time"), _int_field(row, "edit-time"))
-        for embed in (*pdf_embeds([row]), *svg_embeds([row])):
+        for embed in (*pdf_embeds([row]), *svg_embeds([row]), *raster_embeds([row])):
             if (uid, embed.url) in seen:
                 continue
             seen.add((uid, embed.url))
@@ -670,7 +682,7 @@ def attachment_records(
             entry: PdfText | None = pdf_texts.get(key)
             if entry is None or entry.status is not PdfStatus.OK:
                 continue
-            label: str = "PDF" if entry.media is Media.PDF else "SVG"
+            label: str = _MEDIA_LABELS[entry.media]
             pdf_context: str = (
                 f'{context} › {label} "{entry.upload_name}"' if entry.upload_name else f"{context} › {label}"
             )

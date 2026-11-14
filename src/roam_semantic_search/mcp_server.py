@@ -85,7 +85,8 @@ server: Final[MCPServer] = MCPServer(
         " first to see which graphs are connected and which have a searchable index. Results carry"
         " Roam uids — reference a hit as ((uid)) in Roam contexts. A hit of kind 'pdf' is a passage"
         " of a PDF attached in the graph, and one of kind 'image' is text read from an attached image"
-        " (an SVG): its uid is the block carrying the attachment, attachment_name names it, and"
+        " (an SVG's XML, or a photo or screenshot by OCR): its uid is the block carrying the attachment,"
+        " attachment_name names it, and"
         " attachment_page gives a PDF's page. An index is a snapshot of its"
         " graph: call refresh_index first when freshness matters (needs Roam Desktop running)."
     ),
@@ -412,7 +413,7 @@ def semantic_search(graph: str, query: str, k: int = 10) -> SearchResponse:
     Each hit carries the Roam uid — reference it as ``((uid))`` — plus its page,
     breadcrumb context path, and plain text.  Its ``kind`` is ``page``, ``block``, ``pdf``
     (a passage of a PDF attached in the graph), or ``image`` (text read from an attached
-    image — an SVG's).  An attachment hit's ``uid`` is the block that carries the
+    image — an SVG's, or a raster image's by OCR).  An attachment hit's ``uid`` is the block that carries the
     attachment, ``attachment_name`` names it, and ``attachment_page`` gives a PDF's page;
     each attachment appears at most once, as its best-matching passage.
 

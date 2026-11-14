@@ -1,5 +1,9 @@
 """Tests for roam_semantic_search.pdf_text."""
 
+# pyright: reportMissingTypeStubs=false, reportUnknownMemberType=false
+# Rationale: pypdfium2 (rendering a test image) ships no type stubs, as in pdf_text.py itself.
+
+import io
 import sqlite3
 import stat
 from collections.abc import Mapping, Sequence
@@ -7,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Final
 
+import pypdfium2
 import pytest
 import requests
 from guffin.roam.asset import RoamAsset
@@ -17,6 +22,7 @@ from roam_semantic_search import pdf_text
 from roam_semantic_search.ocr import OCR_VERSION, ocr_available
 from roam_semantic_search.pdf_text import (
     CONSECUTIVE_FETCH_FAILURE_LIMIT,
+    FETCH_TIMEOUT_SECONDS,
     ExtractedText,
     ExtractionSummary,
     Media,
@@ -26,9 +32,11 @@ from roam_semantic_search.pdf_text import (
     PdfText,
     cached_pdf_texts,
     extract_pdf_texts,
+    extracted_raster_text,
     extracted_svg_text,
     extracted_text,
     pdf_embeds,
+    raster_embeds,
     svg_embeds,
     url_key,
 )
@@ -79,14 +87,19 @@ def url(name: str) -> str:
 
 
 class FakeSource(GraphSource):
-    """A graph source serving PDFs from memory, recording every fetch."""
+    """A graph source serving PDFs from memory, recording every fetch and its timeout.
+
+    A ``hanging`` URL never answers: its fetch times out, whatever the timeout.
+    """
 
     model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
     files: Mapping[str, bytes]
     failing: frozenset[str] = frozenset()
+    hanging: frozenset[str] = frozenset()
     unreachable: bool = False
     fetched: list[str] = Field(default_factory=list[str])
+    timeouts: list[float | None] = Field(default_factory=list[float | None])
 
     @property
     def graph_name(self) -> str:
@@ -95,10 +108,13 @@ class FakeSource(GraphSource):
     def query(self, query: DatalogQuery) -> DatalogRows:
         raise NotImplementedError
 
-    def fetch_file(self, url: HttpUrl) -> RoamAsset:
+    def fetch_file(self, url: HttpUrl, timeout: float | None = None) -> RoamAsset:
         self.fetched.append(str(url))
+        self.timeouts.append(timeout)
         if self.unreachable:
             raise requests.exceptions.ConnectionError("Local API unreachable")
+        if str(url) in self.hanging:
+            raise requests.exceptions.ReadTimeout(f"Read timed out. (read timeout={timeout})")
         if str(url) in self.failing:
             raise requests.exceptions.HTTPError("Status Code: 500, Unable to get file metadata")
         return RoamAsset(
@@ -314,6 +330,55 @@ class TestFetchBudget:
         assert PdfFetchBudget(max_bytes=100).exhausted(1, 100, 0)
         assert PdfFetchBudget(max_seconds=5).exhausted(1, 0, 5.0)
 
+    def test_fetch_timeout_is_the_fixed_one_or_the_time_left(self) -> None:
+        assert PdfFetchBudget().fetch_timeout(10**6) == FETCH_TIMEOUT_SECONDS
+        assert PdfFetchBudget(max_seconds=FETCH_TIMEOUT_SECONDS * 2).fetch_timeout(1.0) == FETCH_TIMEOUT_SECONDS
+        assert PdfFetchBudget(max_seconds=15).fetch_timeout(11.5) == 3.5
+
+
+class TestFetchTimeout:
+    def test_every_fetch_waits_at_most_the_fixed_timeout(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        files: Final[dict[str, bytes]] = {url(name): pdf_bytes([_LINE_ONE]) for name in ("a.pdf", "b.pdf")}
+        source: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embeds(url("a.pdf"), url("b.pdf")), source)
+        assert source.timeouts == [FETCH_TIMEOUT_SECONDS, FETCH_TIMEOUT_SECONDS]
+
+    def test_an_unanswered_fetch_is_cached_as_failed_and_the_run_goes_on(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        source: Final[FakeSource] = FakeSource(
+            files={url("b.pdf"): pdf_bytes([_LINE_ONE])}, hanging=frozenset({url("a.pdf")})
+        )
+        summary: Final[ExtractionSummary] = extract_pdf_texts(cache, embeds(url("a.pdf"), url("b.pdf")), source)
+        assert summary.outcomes == {PdfStatus.FETCH_FAILED: 1, PdfStatus.OK: 1}
+        assert summary.pending_count == 0
+        failed: Final[PdfText] = cached_pdf_texts(cache)[url_key(url("a.pdf"))]
+        assert failed.status is PdfStatus.FETCH_FAILED
+        assert failed.error is not None and failed.error.startswith("Timeout: no answer from Roam Desktop")
+
+    def test_a_wait_the_time_budget_cuts_short_leaves_the_attachment_pending(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        source: Final[FakeSource] = FakeSource(
+            files={url("b.pdf"): pdf_bytes([_LINE_ONE])}, hanging=frozenset({url("a.pdf")})
+        )
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            cache, embeds(url("a.pdf"), url("b.pdf")), source, budget=PdfFetchBudget(max_seconds=15)
+        )
+        assert source.fetched == [url("a.pdf")]
+        timeout: Final[float | None] = source.timeouts[0]
+        assert timeout is not None and 0 < timeout <= 15
+        assert summary.outcomes == {}
+        assert summary.pending_count == 2
+        assert cached_pdf_texts(cache) == {}
+
+    def test_unanswered_fetches_count_toward_the_failure_limit(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        names: Final[list[str]] = [f"{index}.pdf" for index in range(CONSECUTIVE_FETCH_FAILURE_LIMIT)]
+        source: Final[FakeSource] = FakeSource(files={}, hanging=frozenset(url(name) for name in names))
+        with pytest.raises(RuntimeError, match="failed in a row"):
+            extract_pdf_texts(cache, embeds(*(url(name) for name in names)), source)
+        assert cached_pdf_texts(cache) == {}
+
 
 _SCANNED: Final[str] = "Receipt for the garden shed paint, total 42 dollars"
 """The text rendered into fixtures/scanned.pdf, an image-only PDF (no text layer)."""
@@ -516,3 +581,92 @@ class TestSvgExtraction:
         again: Final[FakeSource] = FakeSource(files=files)
         extract_pdf_texts(cache, embed, again, ocr=True)
         assert again.fetched == []
+
+
+def png_of(text: str) -> bytes:
+    """A PNG image of *text*, rendered from a one-page PDF (no text layer survives rendering)."""
+    page = pypdfium2.PdfDocument(pdf_bytes([text]))[0]
+    buffer: Final[io.BytesIO] = io.BytesIO()
+    page.render(scale=2).to_pil().save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def stub_image_ocr(monkeypatch: pytest.MonkeyPatch, text: str) -> list[int]:
+    """Make OCR available and have every image read as *text*; return the list each read appends to."""
+    calls: Final[list[int]] = []
+
+    def readable_image_text(image: bytes) -> str:
+        calls.append(1)
+        return text
+
+    monkeypatch.setattr(pdf_text, "ocr_available", lambda: True)
+    monkeypatch.setattr(pdf_text, "readable_image_text", readable_image_text)
+    return calls
+
+
+class TestRasterEmbeds:
+    def test_raster_uploads_embedded_linked_or_bare(self) -> None:
+        jpeg: Final[str] = url("Ab3dE.jpeg.enc")
+        png: Final[str] = url("Xy9Zq.PNG")
+        webp: Final[str] = url("Kk2Lm.webp")
+        rows: Final[list[dict[str, object]]] = [
+            {"uid": "aaaaaaaaa", "string": f"![receipt]({jpeg}) and a diagram ![]({url('d.svg')})"},
+            {"uid": "bbbbbbbbb", "string": f"screenshot {png} and [the photo]({webp})"},
+            {"uid": "ccccccccc", "string": f"{{{{pdf: {url('paper.pdf')}}}}}"},
+        ]
+        assert raster_embeds(rows) == [
+            PdfEmbed(host_uid="aaaaaaaaa", url=jpeg, media=Media.RASTER),
+            PdfEmbed(host_uid="bbbbbbbbb", url=png, media=Media.RASTER),
+            PdfEmbed(host_uid="bbbbbbbbb", url=webp, media=Media.RASTER),
+        ]
+
+
+class TestExtractedRasterText:
+    @pytest.mark.skipif(not ocr_available(), reason="on-device OCR (macOS Vision via pyobjc) is unavailable")
+    def test_vision_reads_an_image(self) -> None:
+        found: Final[ExtractedText] = extracted_raster_text(png_of("Warranty covers the roof panels for ten years"))
+        assert (found.status, found.ocr_page_count) == (PdfStatus.OK, 1)
+        assert found.page_texts == ("Warranty covers the roof panels for ten years",)
+
+    @pytest.mark.skipif(not ocr_available(), reason="on-device OCR (macOS Vision via pyobjc) is unavailable")
+    def test_a_blank_image_has_no_text(self) -> None:
+        assert extracted_raster_text(png_of("")) == ExtractedText(PdfStatus.NO_TEXT, ("",), None, 0)
+
+
+class TestRasterExtraction:
+    def test_only_an_ocr_run_fetches_a_raster_image(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        photo: Final[str] = url("receipt.jpeg")
+        embed: Final[list[PdfEmbed]] = [PdfEmbed(host_uid="aaaaaaaaa", url=photo, media=Media.RASTER)]
+        files: Final[dict[str, bytes]] = {photo: b"jpeg bytes"}
+        plain: Final[FakeSource] = FakeSource(files=files)
+        summary: Final[ExtractionSummary] = extract_pdf_texts(cache, embed, plain)
+        assert (plain.fetched, summary.pending_count) == ([], 0)
+
+        calls: Final[list[int]] = stub_image_ocr(monkeypatch, "Receipt for the garden shed paint, total due")
+        reading: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embed, reading, ocr=True)
+        assert (reading.fetched, len(calls)) == ([photo], 1)
+        entry: Final[PdfText] = cached_pdf_texts(cache)[url_key(photo)]
+        assert (entry.media, entry.status, entry.ocr_version, entry.ocr_page_count) == (
+            Media.RASTER,
+            PdfStatus.OK,
+            OCR_VERSION,
+            1,
+        )
+
+    def test_a_read_image_comes_back_only_for_newer_ocr(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        photo: Final[str] = url("landscape.jpeg")
+        embed: Final[list[PdfEmbed]] = [PdfEmbed(host_uid="aaaaaaaaa", url=photo, media=Media.RASTER)]
+        files: Final[dict[str, bytes]] = {photo: b"jpeg bytes"}
+        stub_image_ocr(monkeypatch, "")
+        extract_pdf_texts(cache, embed, FakeSource(files=files), ocr=True)
+        assert cached_pdf_texts(cache)[url_key(photo)].status is PdfStatus.NO_TEXT
+        again: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embed, again, ocr=True)
+        assert again.fetched == []
+        monkeypatch.setattr(pdf_text, "OCR_VERSION", OCR_VERSION + 1)
+        newer: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embed, newer, ocr=True)
+        assert newer.fetched == [photo]
