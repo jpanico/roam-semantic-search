@@ -84,8 +84,9 @@ server: Final[MCPServer] = MCPServer(
         " connected, so every tool requires a graph argument (its nickname) — call list_indexes"
         " first to see which graphs are connected and which have a searchable index. Results carry"
         " Roam uids — reference a hit as ((uid)) in Roam contexts. A hit of kind 'pdf' is a passage"
-        " of a PDF attached in the graph: its uid is the block embedding the PDF, and it names the"
-        " PDF (pdf_name) and page (pdf_page). An index is a snapshot of its"
+        " of a PDF attached in the graph, and one of kind 'image' is text read from an attached image"
+        " (an SVG): its uid is the block carrying the attachment, attachment_name names it, and"
+        " attachment_page gives a PDF's page. An index is a snapshot of its"
         " graph: call refresh_index first when freshness matters (needs Roam Desktop running)."
     ),
 )
@@ -409,10 +410,11 @@ def semantic_search(graph: str, query: str, k: int = 10) -> SearchResponse:
     Hybrid retrieval: the query is embedded locally and ranked against every
     record's vector, fused (reciprocal rank fusion) with a BM25 keyword ranking.
     Each hit carries the Roam uid — reference it as ``((uid))`` — plus its page,
-    breadcrumb context path, and plain text.  Its ``kind`` is ``page``, ``block``, or
-    ``pdf``: a passage of a PDF attached in the graph, whose ``uid`` is the block that
-    embeds the PDF and whose ``pdf_name`` and ``pdf_page`` say which PDF and page.  Each
-    PDF appears at most once, as its best-matching passage.
+    breadcrumb context path, and plain text.  Its ``kind`` is ``page``, ``block``, ``pdf``
+    (a passage of a PDF attached in the graph), or ``image`` (text read from an attached
+    image — an SVG's).  An attachment hit's ``uid`` is the block that carries the
+    attachment, ``attachment_name`` names it, and ``attachment_page`` gives a PDF's page;
+    each attachment appears at most once, as its best-matching passage.
 
     The index is a snapshot, but staleness is bounded: when the last capture is older
     than the staleness threshold (``ROAM_SEMANTIC_SEARCH_MAX_STALENESS``, default one

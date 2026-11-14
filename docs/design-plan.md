@@ -267,7 +267,8 @@ roam-semantic-search/
   DONE 2026-11-14.** Index the text inside attached PDFs — about 1,400 in
   hippo, most of them encrypted. Measurements, design, the 5a–5e sub-phases, and 5a's
   results are in *PDF attachments* below.
-- **Phase 6 — image attachment text: PLANNED 2026-11-14.** Index the text inside
+- **Phase 6 — image attachment text: PLANNED 2026-11-14; 6a (SVG text) DONE
+  2026-11-14.** Index the text inside
   attached images: SVGs first (6a — their text is in the XML, no OCR needed), then,
   only if a measurement justifies it, raster images by OCR (6b measure, 6c build).
   Measurements, design, and sub-phases are in *Image attachments* below.
@@ -568,8 +569,19 @@ Every file was fetched decrypted into memory and discarded; only counts were kep
 
 ### Sub-phases
 
-- **6a — SVG text.** As designed above; tests over fixture SVGs (plain `<text>`,
-  `<tspan>`, `<foreignObject>`, no text, malformed); live on SCFH.
+- **6a — SVG text: DONE 2026-11-14.** As designed above; tests over fixture SVGs (plain
+  `<text>`, `<tspan>`, `<foreignObject>`, no text, malformed); live on SCFH. *As built:*
+  SVGs ride the PDF pipeline under its existing names — `pdf_text.svg_embeds` and
+  `extracted_svg_text`, a `Media` value on embeds and cache entries, the cache's schema
+  v3 adding `media` (migrated in place), `extract-pdfs` fetching SVGs too — while
+  normalize's `attachment_records` and `indexable_attachment_embeds` replace the
+  PDF-only names. An SVG cache entry never counts as due for OCR. A test pins that an
+  external entity in an SVG is not resolved. Live on SCFH: 8 of the 9 SVGs cached
+  (~10,400 chars; the ninth again `fetch-failed` in Roam), yielding 12 image records;
+  the refresh embedded 51 records and removed 19 — blocks that held nothing but a bare
+  Firebase URL. hippo's refresh removed 103 such blocks. Queries about the
+  stored-program-computer diagram and the programmer–AI triangle found the SVGs' own
+  text, as `image` hits on the blocks that carry them.
 - **6b — measure raster OCR.** A sample of ~50 images per graph: how many carry
   readable text, bytes per image, OCR time. Photos often carry none, and hippo's 1,354
   images could be gigabytes through `file.get` (the 5b crash risk).

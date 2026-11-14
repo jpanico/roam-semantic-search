@@ -39,7 +39,12 @@ Full design, phase results, and decision log: [docs/design-plan.md](docs/design-
 - **Attached PDFs** — each page of an attached PDF with a text layer becomes one or
   more chunk records (~2,000 chars, overlapping), set in the context of the block
   that embeds the PDF and carrying that block's uid. The text comes from a local
-  cache that `extract-pdfs` fills; indexing never fetches a PDF itself.
+  cache that fetching fills (`extract-pdfs`, or `build` / `refresh` within a budget).
+- **Attached SVGs** — an SVG upload a block names (as an image or a bare URL)
+  contributes the words in its XML — titles, descriptions, text runs, and foreign
+  objects — as an `image` record in its block's context; no OCR is involved. A bare
+  Firebase Storage URL is stripped from block text, since it is never prose and it
+  carries an access token.
 - **Embed** — a local [Ollama](https://ollama.com) server running
   `nomic-embed-text` (768-dim), with the model's `search_document:` /
   `search_query:` retrieval prefixes. Loopback-only, enforced.
@@ -142,7 +147,10 @@ roam-semantic-search stats --graph scfh           # store provenance: model, cou
 `--port` and `--token` are needed only to override the registry, or to reach a graph it
 does not know about.
 
-### PDF attachments: `extract-pdfs`
+### PDF and SVG attachments: `extract-pdfs`
+
+SVG uploads go through the same path as PDFs — fetched, cached, and indexed alongside
+them — but their text is read straight from the XML, so they need no OCR.
 
 `build` and `refresh` index attached PDFs (`--no-pdfs` leaves them out): each first
 fetches the PDFs its text cache lacks, within a budget, then indexes the cached text.
@@ -241,9 +249,11 @@ client, with four tools:
 | `refresh_index` | Incremental refresh from the live graph, on demand |
 | `index_stats` | One store's provenance |
 
-A hit's `kind` is `page`, `block`, or `pdf`. A `pdf` hit is a passage of an attached PDF:
-its `uid` is the block that embeds the PDF, and `pdf_name` and `pdf_page` say which PDF
-and page. Each PDF appears at most once, as its best-matching passage.
+A hit's `kind` is `page`, `block`, `pdf`, or `image`. A `pdf` hit is a passage of an
+attached PDF and an `image` hit is text read from an attached SVG: its `uid` is the block
+that carries the attachment, `attachment_name` names it, and `attachment_page` gives a
+PDF's page (`pdf_name` / `pdf_page` repeat them for PDF hits). Each attachment appears at
+most once, as its best-matching passage.
 
 Every refresh the server runs carries a small PDF budget — 10 PDFs, 50 MB, 15 s, and 250
 passage embeddings — and its summary reports `pdf_pending_count` and

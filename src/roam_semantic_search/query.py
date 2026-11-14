@@ -5,11 +5,11 @@ Public symbols:
 - :data:`RRF_K` — the reciprocal-rank-fusion damping constant.
 - :class:`SearchHit` — one ranked search result.
 - :func:`rrf_fused` — fuse rankings into one score per item (reciprocal rank fusion).
-- :func:`collapse_key` — what a hit is deduplicated by: its record, or for a PDF chunk its PDF.
+- :func:`collapse_key` — what a hit is deduplicated by: its record, or for an attachment chunk its attachment.
 - :func:`search_store` — answer a natural-language query from a store.
 
 A long PDF yields hundreds of chunk records, which would otherwise fill the results with one
-document; hits therefore collapse to the best-ranked chunk of each PDF.
+document; hits therefore collapse to the best-ranked chunk of each attachment (PDF or image).
 """
 
 from collections.abc import Sequence
@@ -36,7 +36,7 @@ RRF_K: Final[int] = 60
 
 _CANDIDATE_POOL_MIN: Final[int] = 200
 _CANDIDATE_POOL_FACTOR: Final[int] = 10
-_PDF_RECORD_ID_SEPARATOR: Final[str] = "/pdf/"
+_ATTACHMENT_RECORD_ID_SEPARATORS: Final[tuple[str, ...]] = ("/pdf/", "/img/")
 
 
 class SearchHit(BaseModel):
@@ -52,9 +52,13 @@ class SearchHit(BaseModel):
         breadcrumb: The hit's context path (for a PDF chunk, ending in the PDF's name).
         text: The hit's plain text (for a PDF chunk, the matching passage).
         is_page: Whether the hit is a page rather than a block.
-        kind: What the hit is: ``page``, ``block``, or ``pdf`` (a passage of an attached PDF).
-        pdf_name: For a PDF hit, the name the PDF was uploaded under, when known.
-        pdf_page: For a PDF hit, the 1-based page the passage is on.
+        kind: What the hit is: ``page``, ``block``, ``pdf`` (a passage of an attached PDF), or
+            ``image`` (text read from an attached image — today an SVG's).
+        attachment_name: For a ``pdf`` or ``image`` hit, the name the attachment was
+            uploaded under, when known.
+        attachment_page: For a ``pdf`` hit, the 1-based page the passage is on.
+        pdf_name: ``attachment_name`` for a ``pdf`` hit only (kept for earlier consumers).
+        pdf_page: ``attachment_page`` for a ``pdf`` hit only (kept for earlier consumers).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -68,6 +72,8 @@ class SearchHit(BaseModel):
     text: str
     is_page: bool
     kind: RecordKind
+    attachment_name: str | None = None
+    attachment_page: int | None = None
     pdf_name: str | None = None
     pdf_page: int | None = None
 
@@ -95,15 +101,17 @@ def rrf_fused(rankings: Sequence[Sequence[str]], rrf_k: int = RRF_K) -> dict[str
 
 @validate_call
 def collapse_key(record_id: str) -> str:
-    """What a hit is deduplicated by: its record id, or for a PDF chunk the PDF it belongs to.
+    """What a hit is deduplicated by: its record id, or for an attachment chunk its attachment.
 
     Args:
-        record_id: The hit's record id (``<uid>/pdf/<key>/<page>.<chunk>`` for a PDF chunk).
+        record_id: The hit's record id (``<uid>/pdf/<key>/<page>.<chunk>`` for a PDF chunk,
+            ``<uid>/img/<key>/1.<chunk>`` for an image's text).
 
     Returns:
-        The record id itself, or ``<uid>/pdf/<key>`` for a PDF chunk.
+        The record id itself, or ``<uid>/pdf/<key>`` / ``<uid>/img/<key>`` for an
+        attachment chunk.
     """
-    if _PDF_RECORD_ID_SEPARATOR not in record_id:
+    if not any(separator in record_id for separator in _ATTACHMENT_RECORD_ID_SEPARATORS):
         return record_id
     return record_id.rsplit("/", 1)[0]
 
@@ -187,8 +195,10 @@ def search_store(
                 text=record.text,
                 is_page=record.is_page,
                 kind=record.kind,
-                pdf_name=record.pdf_name,
-                pdf_page=record.pdf_page,
+                attachment_name=record.pdf_name,
+                attachment_page=record.pdf_page if record.kind is RecordKind.PDF else None,
+                pdf_name=record.pdf_name if record.kind is RecordKind.PDF else None,
+                pdf_page=record.pdf_page if record.kind is RecordKind.PDF else None,
             )
         )
     return hits

@@ -1,4 +1,9 @@
-"""PDF attachment text: find a graph's PDF embeds, extract their text, and cache it.
+"""Attachment text: find a graph's PDF and SVG attachments, extract their text, and cache it.
+
+SVGs (Phase 6a) share the PDF pipeline end to end — discovery, the decrypting fetch, the
+budget, and the cache — and differ only in extraction: an SVG's words are in its XML
+(:func:`extracted_svg_text`), so it needs no OCR, and it is kept as a one-page document.
+The module and its cache file keep their PDF-era names.
 
 A PDF sits in a block as ``{{pdf: <url>}}`` or ``{{[[pdf]]: <url>}}``; the full-graph pull
 carries only that markup, never the file.  This module reaches the content: each distinct URL
@@ -19,7 +24,8 @@ entries by a digest of the URL, never the URL itself (a Firebase URL embeds an a
 
 Public symbols:
 
-- :class:`PdfEmbed` — one PDF embed: the hosting block's uid and the PDF's storage URL.
+- :class:`Media` — what kind of attachment an embed or cache entry is: a PDF or an SVG.
+- :class:`PdfEmbed` — one attachment: the hosting block's uid, its storage URL, its media.
 - :class:`PdfStatus` — the outcome of one PDF's extraction.
 - :class:`PdfText` — one cached extraction result.
 - :class:`ExtractedText` — what extracting one PDF found: status, page texts, OCR'd pages.
@@ -30,6 +36,8 @@ Public symbols:
 - :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` — failed fetches in a row that abort a run.
 - :func:`default_pdf_cache_path` — the conventional cache location for a graph.
 - :func:`pdf_embeds` — pull-block rows → every PDF embed, in row order.
+- :func:`svg_embeds` — pull-block rows → every SVG upload a block names, in row order.
+- :func:`extracted_svg_text` — SVG bytes → status and text, read from the XML.
 - :func:`url_key` — the cache key of a PDF URL.
 - :func:`extracted_text` — PDF bytes → status, per-page text, error.
 - :func:`cached_pdf_texts` — every cached extraction result by URL key.
@@ -46,6 +54,7 @@ import json
 import logging
 import sqlite3
 import time
+import xml.etree.ElementTree as ElementTree
 from collections import Counter
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -58,7 +67,7 @@ import regex
 import requests
 from guffin.roam.asset import RoamAsset
 from guffin.roam.graph_source import GraphSource
-from guffin.roam.markdown import PDF_EMBED_RE
+from guffin.roam.markdown import FIREBASE_STORAGE_URL_RE, PDF_EMBED_RE
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, ValidationError, validate_call
 
 from roam_semantic_search.ocr import OCR_VERSION, ocr_available, recognized_page_text
@@ -74,7 +83,7 @@ NO_TEXT_PAGE_MIN_CHARS: Final[int] = 20
 CONSECUTIVE_FETCH_FAILURE_LIMIT: Final[int] = 5
 """Failed fetches in a row that abort a run: the graph itself, not the files, is failing."""
 
-_CACHE_SCHEMA_VERSION: Final[int] = 2
+_CACHE_SCHEMA_VERSION: Final[int] = 3
 _CACHE_FILE_MODE: Final[int] = 0o600
 _PROGRESS_INTERVAL: Final[int] = 25
 _ERROR_MAX_CHARS: Final[int] = 300
@@ -93,7 +102,8 @@ _SCHEMA_STATEMENTS: Final[tuple[str, ...]] = (
         error TEXT,
         extracted_at TEXT NOT NULL,
         ocr_version INTEGER NOT NULL DEFAULT 0,
-        ocr_page_count INTEGER NOT NULL DEFAULT 0
+        ocr_page_count INTEGER NOT NULL DEFAULT 0,
+        media TEXT NOT NULL DEFAULT 'pdf'
     )
     """,
 )
@@ -104,19 +114,41 @@ _V1_TO_V2_STATEMENTS: Final[tuple[str, ...]] = (
     "UPDATE meta SET value = '2' WHERE key = 'schema_version'",
 )
 
+_V2_TO_V3_STATEMENTS: Final[tuple[str, ...]] = (
+    "ALTER TABLE pdf_texts ADD COLUMN media TEXT NOT NULL DEFAULT 'pdf'",
+    "UPDATE meta SET value = '3' WHERE key = 'schema_version'",
+)
+
+_SVG_TEXT_TAGS: Final[frozenset[str]] = frozenset({"title", "desc", "text", "foreignObject"})
+"""SVG elements whose whole text is read (``<text>`` with its ``<tspan>`` / ``<textPath>``)."""
+
+_SVG_SKIPPED_TAGS: Final[frozenset[str]] = frozenset({"style", "script", "metadata"})
+"""SVG elements whose text is never words a reader sees."""
+
+_SVG_SUFFIXES: Final[tuple[str, ...]] = (".svg", ".svg.enc")
+
+
+class Media(enum.StrEnum):
+    """What kind of attachment an embed or cache entry is."""
+
+    PDF = "pdf"
+    SVG = "svg"
+
 
 class PdfEmbed(BaseModel):
-    """One PDF embed found in a block.
+    """One attachment found in a block — a PDF embed, or (``media`` SVG) an SVG upload.
 
     Attributes:
-        host_uid: The uid of the block whose string embeds the PDF.
-        url: The PDF's Firebase Storage URL, exactly as the block carries it.
+        host_uid: The uid of the block whose string carries the attachment.
+        url: The attachment's Firebase Storage URL, exactly as the block carries it.
+        media: What kind of attachment it is.
     """
 
     model_config = ConfigDict(frozen=True)
 
     host_uid: str
     url: str
+    media: Media = Media.PDF
 
 
 class PdfStatus(enum.StrEnum):
@@ -153,6 +185,7 @@ class PdfText(BaseModel):
         ocr_version: The :data:`~roam_semantic_search.ocr.OCR_VERSION` that read the PDF's
             blank pages, or ``0`` when no OCR has.
         ocr_page_count: How many of ``page_texts`` came from OCR.
+        media: What kind of attachment the entry is (an SVG has one page).
     """
 
     model_config = ConfigDict(frozen=True)
@@ -166,6 +199,7 @@ class PdfText(BaseModel):
     extracted_at: str
     ocr_version: int = 0
     ocr_page_count: int = 0
+    media: Media = Media.PDF
 
 
 class ExtractedText(NamedTuple):
@@ -275,6 +309,31 @@ def pdf_embeds(rows: Sequence[dict[str, object]]) -> list[PdfEmbed]:
 
 
 @validate_call
+def svg_embeds(rows: Sequence[dict[str, object]]) -> list[PdfEmbed]:
+    """Every SVG upload the graph's blocks name, in row order — as an image embed or a bare URL.
+
+    Args:
+        rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
+
+    Returns:
+        One :class:`PdfEmbed` (media SVG) per Firebase Storage URL whose object path ends
+        ``.svg`` or ``.svg.enc``.
+    """
+    embeds: Final[list[PdfEmbed]] = []
+    for row in rows:
+        string: object = row.get("string")
+        uid: object = row.get("uid")
+        if not isinstance(string, str) or not isinstance(uid, str) or ".svg" not in string.lower():
+            continue
+        embeds.extend(
+            PdfEmbed(host_uid=uid, url=match.group(0), media=Media.SVG)
+            for match in FIREBASE_STORAGE_URL_RE.finditer(string)
+            if match.group("object_path").lower().endswith(_SVG_SUFFIXES)
+        )
+    return embeds
+
+
+@validate_call
 def url_key(url: str) -> str:
     """The cache key of a PDF URL: its SHA-256 hex digest (the URL itself is never stored).
 
@@ -338,6 +397,42 @@ def extracted_text(contents: bytes, ocr: bool = False) -> ExtractedText:
     return ExtractedText(status_found, tuple(page_texts), None, ocr_page_count)
 
 
+def _svg_text_pieces(element: ElementTree.Element) -> list[str]:
+    """The text an SVG element shows, in document order (skipped elements contribute nothing)."""
+    tag: Final[str] = element.tag.rsplit("}", 1)[-1]
+    if tag in _SVG_SKIPPED_TAGS:
+        return []
+    if tag in _SVG_TEXT_TAGS:
+        return [" ".join(element.itertext())]
+    return [piece for child in element for piece in _svg_text_pieces(child)]
+
+
+@validate_call
+def extracted_svg_text(contents: bytes) -> ExtractedText:
+    """Read an SVG's text from its XML: titles, descriptions, text runs, and foreign objects.
+
+    The words of a ``<text>`` element (with its ``<tspan>`` / ``<textPath>`` children),
+    ``<title>``, ``<desc>``, and ``<foreignObject>`` (where Mermaid and draw.io put labels)
+    are collected in document order; ``<style>``, ``<script>``, and ``<metadata>`` are
+    skipped.  The standard-library parser resolves no external entities, and the expat it
+    is built on guards against entity-expansion bombs.  Text drawn as outlines is not
+    recoverable this way (that would take rendering and OCR).
+
+    Args:
+        contents: The SVG's (decrypted) bytes.
+
+    Returns:
+        One cleaned "page": OK when it has at least :data:`NO_TEXT_PAGE_MIN_CHARS`
+        non-whitespace chars, else NO_TEXT; PARSE_FAILED for XML that does not parse.
+    """
+    try:
+        root: Final[ElementTree.Element] = ElementTree.fromstring(contents)
+    except ElementTree.ParseError as error:
+        return ExtractedText(PdfStatus.PARSE_FAILED, (), str(error)[:_ERROR_MAX_CHARS])
+    text: Final[str] = _readable(_clean_page_text("\n".join(_svg_text_pieces(root))))
+    return ExtractedText(PdfStatus.OK if text else PdfStatus.NO_TEXT, (text,), None)
+
+
 def _connected_cache(cache_path: Path) -> sqlite3.Connection:
     """Open (creating if absent) the owner-only cache database, schema ensured."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,6 +448,9 @@ def _connected_cache(cache_path: Path) -> sqlite3.Connection:
         if connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "1":
             for statement in _V1_TO_V2_STATEMENTS:  # v2 only adds the OCR columns; every entry is kept
                 connection.execute(statement)
+        if connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2":
+            for statement in _V2_TO_V3_STATEMENTS:  # v3 only adds the media column; every entry is a PDF
+                connection.execute(statement)
     stored_version: Final[str] = connection.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
     if stored_version != str(_CACHE_SCHEMA_VERSION):
         connection.close()
@@ -365,10 +463,10 @@ def _connected_cache(cache_path: Path) -> sqlite3.Connection:
 
 def _read_entries(connection: sqlite3.Connection) -> dict[str, PdfText]:
     """Every cached entry by URL key."""
-    rows: Final[list[tuple[str, str, int, str | None, int | None, str, str | None, str, int, int]]] = list(
+    rows: Final[list[tuple[str, str, int, str | None, int | None, str, str | None, str, int, int, str]]] = list(
         connection.execute(
             "SELECT url_key, status, extractor_version, upload_name, byte_count, page_texts, error, extracted_at,"
-            " ocr_version, ocr_page_count FROM pdf_texts"
+            " ocr_version, ocr_page_count, media FROM pdf_texts"
         )
     )
     return {
@@ -382,6 +480,7 @@ def _read_entries(connection: sqlite3.Connection) -> dict[str, PdfText]:
             extracted_at=extracted_at,
             ocr_version=ocr_version,
             ocr_page_count=ocr_page_count,
+            media=Media(media),
         )
         for (
             key,
@@ -394,6 +493,7 @@ def _read_entries(connection: sqlite3.Connection) -> dict[str, PdfText]:
             extracted_at,
             ocr_version,
             ocr_page_count,
+            media,
         ) in rows
     }
 
@@ -402,7 +502,7 @@ def _write_entry(connection: sqlite3.Connection, key: str, entry: PdfText) -> No
     """Insert or replace one cached entry, committed at once so an interrupted run keeps it."""
     with connection:
         connection.execute(
-            "INSERT OR REPLACE INTO pdf_texts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO pdf_texts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 key,
                 entry.status.value,
@@ -414,6 +514,7 @@ def _write_entry(connection: sqlite3.Connection, key: str, entry: PdfText) -> No
                 entry.extracted_at,
                 entry.ocr_version,
                 entry.ocr_page_count,
+                entry.media.value,
             ),
         )
 
@@ -438,8 +539,8 @@ def cached_pdf_texts(cache_path: Path) -> dict[str, PdfText]:
 
 
 def _needs_ocr(entry: PdfText) -> bool:
-    """Whether a cached PDF has blank pages that no current OCR has read."""
-    return "" in entry.page_texts and entry.ocr_version < OCR_VERSION
+    """Whether a cached PDF has blank pages that no current OCR has read (never an SVG)."""
+    return entry.media is Media.PDF and "" in entry.page_texts and entry.ocr_version < OCR_VERSION
 
 
 def _needs_extraction(entry: PdfText | None, retry_failed: bool, ocr: bool) -> bool:
@@ -467,8 +568,8 @@ def _now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def _fetched_entry(source: GraphSource, url: str, ocr: bool) -> PdfText:
-    """Fetch one PDF into memory, extract it, and return its cache entry (bytes discarded).
+def _fetched_entry(source: GraphSource, url: str, ocr: bool, media: Media) -> PdfText:
+    """Fetch one attachment into memory, extract it, and return its cache entry (bytes discarded).
 
     A Local API error answering for this file (an HTTP error status, or a malformed
     response) yields a :attr:`PdfStatus.FETCH_FAILED` entry; anything else — the Local API
@@ -482,8 +583,11 @@ def _fetched_entry(source: GraphSource, url: str, ocr: bool) -> PdfText:
             extractor_version=EXTRACTOR_VERSION,
             error=f"{type(error).__name__}: {error}"[:_ERROR_MAX_CHARS],
             extracted_at=_now(),
+            media=media,
         )
-    extraction: Final[ExtractedText] = extracted_text(asset.contents, ocr=ocr)
+    extraction: Final[ExtractedText] = (
+        extracted_svg_text(asset.contents) if media is Media.SVG else extracted_text(asset.contents, ocr=ocr)
+    )
     return PdfText(
         status=extraction.status,
         extractor_version=EXTRACTOR_VERSION,
@@ -492,8 +596,9 @@ def _fetched_entry(source: GraphSource, url: str, ocr: bool) -> PdfText:
         page_texts=extraction.page_texts,
         error=extraction.error,
         extracted_at=_now(),
-        ocr_version=OCR_VERSION if ocr else 0,
+        ocr_version=OCR_VERSION if ocr and media is Media.PDF else 0,
         ocr_page_count=extraction.ocr_page_count,
+        media=media,
     )
 
 
@@ -534,7 +639,10 @@ def extract_pdf_texts(
     Raises:
         RuntimeError: If :data:`CONSECUTIVE_FETCH_FAILURE_LIMIT` fetches fail in a row.
     """
-    urls: Final[list[str]] = list(dict.fromkeys(embed.url for embed in embeds))
+    media_by_url: Final[dict[str, Media]] = {}
+    for embed in embeds:
+        media_by_url.setdefault(embed.url, embed.media)
+    urls: Final[list[str]] = list(media_by_url)
     bounds: Final[PdfFetchBudget] = budget if budget is not None else PdfFetchBudget()
     run_ocr: Final[bool] = ocr and ocr_available()
     if ocr and not run_ocr:
@@ -549,14 +657,14 @@ def extract_pdf_texts(
         due: Final[list[str]] = [
             url for url in urls if _needs_extraction(cached.get(url_key(url)), retry_failed, run_ocr)
         ]
-        logger.info("%d distinct PDFs; %d need extraction", len(urls), len(due))
+        logger.info("%d distinct attachments; %d need extraction", len(urls), len(due))
         outcomes: Final[Counter[PdfStatus]] = Counter()
         failure_run: Final[list[tuple[str, PdfText]]] = []
         for url in due:
             if bounds.exhausted(fetched, fetched_bytes, time.monotonic() - started):
                 logger.info("fetch budget reached after %d PDFs (%d bytes)", fetched, fetched_bytes)
                 break
-            entry: PdfText = _fetched_entry(source, url, run_ocr)
+            entry: PdfText = _fetched_entry(source, url, run_ocr, media_by_url[url])
             fetched += 1
             fetched_bytes += entry.byte_count or 0
             ocr_pages += entry.ocr_page_count

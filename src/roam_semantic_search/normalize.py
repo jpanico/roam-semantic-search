@@ -8,19 +8,21 @@ direct-child ``tags::`` values (its *tags*) — descendant block text folded in 
 order, and skip rules applied (system pages, daily notes on request, blocks left empty
 by cleanup).
 
-Attached PDFs contribute records of their own: :func:`pdf_chunk_records` turns the cached
-text of each PDF a block embeds (:mod:`roam_semantic_search.pdf_text`) into one record per
-chunk of a page, set in its host block's context.  Chunk text never folds into any other
-record's descendant text — a long PDF would swamp every ancestor and page record.
+Attachments contribute records of their own: :func:`attachment_records` turns the cached
+text of each PDF a block embeds and each SVG it names (:mod:`roam_semantic_search.pdf_text`)
+into one record per chunk of a page, set in its host block's context.  Attachment text
+never folds into any other record's descendant text — a long PDF would swamp every
+ancestor and page record.  A bare Firebase Storage URL is stripped from block text: it is
+never prose, and it carries an access token.
 
 Public symbols:
 
-- :class:`RecordKind` — what a record represents: a page, a block, or a PDF chunk.
-- :class:`PdfLocator` — where a PDF chunk record sits: which PDF, page, and chunk.
+- :class:`RecordKind` — what a record represents: a page, a block, a PDF chunk, or an image's text.
+- :class:`PdfLocator` — where an attachment record sits: which attachment, page, and chunk.
 - :class:`IndexRecord` — one embeddable record: identity, context, text, hash, bookkeeping.
 - :func:`normalized_records` — pull-block rows → the records worth indexing.
-- :func:`pdf_chunk_records` — pull-block rows + cached PDF text → one record per chunk.
-- :func:`indexable_pdf_embeds` — the PDF embeds whose chunks the index would hold.
+- :func:`attachment_records` — pull-block rows + cached attachment text → one record per chunk.
+- :func:`indexable_attachment_embeds` — the PDFs and SVGs whose text the index would hold.
 - :data:`PDF_CHUNK_MAX_CHARS` / :data:`PDF_CHUNK_OVERLAP_CHARS` — the PDF chunking sizes.
 - :data:`SKIPPED_PAGE_PREFIXES` — page-title prefixes excluded from the index (with their blocks).
 - :data:`REF_PREVIEW_MAX_CHARS` — length cap on a resolved block reference's inserted text.
@@ -35,10 +37,11 @@ from typing import Final
 
 import regex
 from guffin.model.primitives import DAILY_NOTE_UID_PATTERN, UID_PATTERN
+from guffin.roam.markdown import FIREBASE_STORAGE_URL_RE
 from pydantic import BaseModel, ConfigDict, validate_call
 
 from roam_semantic_search.json_narrowing import is_json_list, is_json_object
-from roam_semantic_search.pdf_text import PdfEmbed, PdfStatus, PdfText, pdf_embeds, url_key
+from roam_semantic_search.pdf_text import Media, PdfEmbed, PdfStatus, PdfText, pdf_embeds, svg_embeds, url_key
 
 SKIPPED_PAGE_PREFIXES: Final[tuple[str, ...]] = ("roam/",)
 """Page-title prefixes whose pages (and all their blocks) are excluded from the index."""
@@ -90,16 +93,21 @@ class RecordKind(enum.StrEnum):
     PDF = "pdf"
     """One chunk of a page of a PDF a block embeds."""
 
+    IMAGE = "image"
+    """One chunk of the text of an image a block names (an SVG's, read from its XML)."""
+
 
 class PdfLocator(BaseModel):
-    """Where a PDF chunk record sits.
+    """Where an attachment record sits — a PDF chunk, or (``media`` SVG) an image's text.
 
     Attributes:
-        key: The first characters of the PDF URL's cache key (:func:`~roam_semantic_search.pdf_text.url_key`)
-            — enough to tell apart the PDFs one block embeds, never the URL itself.
-        page: The 1-based page number the chunk comes from.
+        key: The first characters of the attachment URL's cache key
+            (:func:`~roam_semantic_search.pdf_text.url_key`) — enough to tell apart the
+            attachments one block carries, never the URL itself.
+        page: The 1-based page number the chunk comes from (always 1 for an SVG).
         chunk: The chunk's 1-based position within its page.
-        name: The name the PDF was uploaded under, when known.
+        name: The name the attachment was uploaded under, when known.
+        media: What kind of attachment it is.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -108,6 +116,7 @@ class PdfLocator(BaseModel):
     page: int
     chunk: int
     name: str | None = None
+    media: Media = Media.PDF
 
 
 class IndexRecord(BaseModel):
@@ -152,9 +161,9 @@ class IndexRecord(BaseModel):
 
     @property
     def kind(self) -> RecordKind:
-        """What the record represents: a page, a block, or a PDF chunk."""
+        """What the record represents: a page, a block, a PDF chunk, or an image's text."""
         if self.pdf is not None:
-            return RecordKind.PDF
+            return RecordKind.PDF if self.pdf.media is Media.PDF else RecordKind.IMAGE
         return RecordKind.PAGE if self.is_page else RecordKind.BLOCK
 
     @property
@@ -162,11 +171,13 @@ class IndexRecord(BaseModel):
         """The record's unique identity in the store.
 
         The Roam uid for a page or block record; ``<uid>/pdf/<key>/<page>.<chunk>`` for a
-        PDF chunk, since every chunk of every PDF a block embeds shares the block's uid.
+        PDF chunk and ``<uid>/img/<key>/1.<chunk>`` for an image's text, since every chunk
+        of every attachment a block carries shares the block's uid.
         """
         if self.pdf is None:
             return self.uid
-        return f"{self.uid}/pdf/{self.pdf.key}/{self.pdf.page}.{self.pdf.chunk}"
+        segment: Final[str] = "pdf" if self.pdf.media is Media.PDF else "img"
+        return f"{self.uid}/{segment}/{self.pdf.key}/{self.pdf.page}.{self.pdf.chunk}"
 
 
 def _str_field(row: Mapping[str, object], key: str) -> str | None:
@@ -228,6 +239,7 @@ def _plain_text(raw_text: str, ref_texts: Mapping[str, str]) -> str:
     text = _WIDGET_RE.sub("", text)
     text = _IMAGE_RE.sub(r"\1", text)
     text = _MD_LINK_RE.sub(r"\1", text)
+    text = FIREBASE_STORAGE_URL_RE.sub("", text)
     text = _COLOR_TAG_RE.sub("", text)
     text = _HASH_BRACKET_RE.sub("", text)
     while _PAGE_REF_RE.search(text) is not None:
@@ -574,18 +586,18 @@ def _indexable_page_dbids(rows: Sequence[Mapping[str, object]], include_daily_no
 
 
 @validate_call
-def indexable_pdf_embeds(rows: Sequence[dict[str, object]], include_daily_notes: bool = True) -> list[PdfEmbed]:
-    """The PDF embeds of blocks on indexable pages — the PDFs whose text the index would hold.
+def indexable_attachment_embeds(rows: Sequence[dict[str, object]], include_daily_notes: bool = True) -> list[PdfEmbed]:
+    """The PDF and SVG attachments of blocks on indexable pages — those whose text the index would hold.
 
     A refresh fetches only these, so a ``--no-daily-notes`` index never spends its fetch
-    budget on PDFs it would not index.
+    budget on attachments it would not index.
 
     Args:
         rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
         include_daily_notes: Whether daily-note pages count as indexable.
 
     Returns:
-        The embeds, in row order.
+        The embeds, in row order: each block's PDFs, then its SVGs.
     """
     indexable_page_dbids: Final[set[int]] = _indexable_page_dbids(rows, include_daily_notes)
     hosts: Final[list[dict[str, object]]] = [
@@ -595,32 +607,34 @@ def indexable_pdf_embeds(rows: Sequence[dict[str, object]], include_daily_notes:
         and (page_id := _stub_id(row, "page")) is not None
         and page_id in indexable_page_dbids
     ]
-    return pdf_embeds(hosts)
+    return [embed for host in hosts for embed in (*pdf_embeds([host]), *svg_embeds([host]))]
 
 
 @validate_call
-def pdf_chunk_records(
+def attachment_records(
     rows: Sequence[dict[str, object]],
     pdf_texts: Mapping[str, PdfText],
     include_daily_notes: bool = True,
 ) -> list[IndexRecord]:
-    """Derive one index record per chunk of every cached PDF the graph's blocks embed.
+    """Derive one index record per chunk of every cached attachment the graph's blocks carry.
 
     A block on an indexable page that embeds a PDF (``{{pdf: <url>}}`` / ``{{[[pdf]]: <url>}}``)
-    whose cached extraction is :attr:`~roam_semantic_search.pdf_text.PdfStatus.OK` yields a
-    record for each chunk of each page with a text layer (:func:`_chunked`).  A chunk record
-    carries the host block's uid, so a hit is one ``((uid))`` away from the PDF in its live
-    context; its breadcrumb is the block's context path, its own text, and the PDF's upload
-    name, and that context leads its embed input ahead of the chunk.  A PDF without a cached
-    entry, or whose entry failed or found no text, yields nothing.
+    or names an SVG upload, whose cached extraction is
+    :attr:`~roam_semantic_search.pdf_text.PdfStatus.OK`, yields a record for each chunk of
+    each page with text (:func:`_chunked`) — a PDF chunk, or for an SVG an image record.  A
+    record carries the host block's uid, so a hit is one ``((uid))`` away from the
+    attachment in its live context; its breadcrumb is the block's context path, its own
+    text, and the attachment's upload name, and that context leads its embed input ahead
+    of the chunk.  An attachment without a cached entry, or whose entry failed or found no
+    text, yields nothing.
 
     Args:
         rows: Pull-block rows, one per entity, as returned by the full-graph fetch.
         pdf_texts: Cached extraction results by URL key (:func:`~roam_semantic_search.pdf_text.cached_pdf_texts`).
-        include_daily_notes: Whether PDFs embedded on daily-note pages are indexed.
+        include_daily_notes: Whether attachments on daily-note pages are indexed.
 
     Returns:
-        The chunk records, in row order, then page order, then chunk order.
+        The records, in row order, then attachment, page, and chunk order.
     """
     if not pdf_texts:
         return []
@@ -637,7 +651,7 @@ def pdf_chunk_records(
     for row in rows:
         raw: str | None = _str_field(row, "string")
         uid: str | None = _str_field(row, "uid")
-        if raw is None or uid is None or "pdf" not in raw:
+        if raw is None or uid is None or ("pdf" not in raw and ".svg" not in raw.lower()):
             continue
         page_id: int | None = _stub_id(row, "page")
         if page_id is None or page_id not in indexable_page_dbids:
@@ -648,7 +662,7 @@ def pdf_chunk_records(
         if own_text:
             context = f"{context} › {own_text}"
         edited_at: int = max(_int_field(row, "time"), _int_field(row, "edit-time"))
-        for embed in pdf_embeds([row]):
+        for embed in (*pdf_embeds([row]), *svg_embeds([row])):
             if (uid, embed.url) in seen:
                 continue
             seen.add((uid, embed.url))
@@ -656,12 +670,16 @@ def pdf_chunk_records(
             entry: PdfText | None = pdf_texts.get(key)
             if entry is None or entry.status is not PdfStatus.OK:
                 continue
-            pdf_context: str = f'{context} › PDF "{entry.upload_name}"' if entry.upload_name else f"{context} › PDF"
+            label: str = "PDF" if entry.media is Media.PDF else "SVG"
+            pdf_context: str = (
+                f'{context} › {label} "{entry.upload_name}"' if entry.upload_name else f"{context} › {label}"
+            )
             for page_number, page_text in enumerate(entry.page_texts, start=1):
                 if not page_text:
                     continue
+                lead: str = f"{pdf_context} p. {page_number}" if entry.media is Media.PDF else pdf_context
                 for chunk_number, chunk in enumerate(_chunked(page_text), start=1):
-                    embed_input: str = _embed_input(f"{pdf_context} p. {page_number} › {chunk}", (), (), "")
+                    embed_input: str = _embed_input(f"{lead} › {chunk}", (), (), "")
                     records.append(
                         IndexRecord(
                             uid=uid,
@@ -676,7 +694,11 @@ def pdf_chunk_records(
                             edited_at=edited_at,
                             is_page=False,
                             pdf=PdfLocator(
-                                key=key[:_PDF_KEY_CHARS], page=page_number, chunk=chunk_number, name=entry.upload_name
+                                key=key[:_PDF_KEY_CHARS],
+                                page=page_number,
+                                chunk=chunk_number,
+                                name=entry.upload_name,
+                                media=entry.media,
                             ),
                         )
                     )

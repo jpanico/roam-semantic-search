@@ -5,7 +5,7 @@ Commands:
 - ``graphs`` — list the graphs connected on this machine and which of them are indexed.
 - ``build`` — fetch the graph, normalize, embed locally, and (re)write the index store.
 - ``refresh`` — incrementally update the store: re-embed only changed records, delete vanished ones.
-- ``extract-pdfs`` — fetch the graph's attached PDFs and cache their text, for indexing.
+- ``extract-pdfs`` — fetch the graph's attached PDFs and SVGs and cache their text, for indexing.
 - ``search`` — answer a natural-language query from the store.
 - ``stats`` — print the store's provenance and embedding-model facts.
 
@@ -46,9 +46,9 @@ from roam_semantic_search.graph_windows import WindowState, window_state_for
 from roam_semantic_search.normalize import (
     IndexRecord,
     RecordKind,
-    indexable_pdf_embeds,
+    attachment_records,
+    indexable_attachment_embeds,
     normalized_records,
-    pdf_chunk_records,
 )
 from roam_semantic_search.pdf_text import (
     ExtractionSummary,
@@ -58,6 +58,7 @@ from roam_semantic_search.pdf_text import (
     default_pdf_cache_path,
     extract_pdf_texts,
     pdf_embeds,
+    svg_embeds,
 )
 from roam_semantic_search.query import SearchHit, search_store
 from roam_semantic_search.refresh import RefreshSummary, refresh_store
@@ -252,7 +253,7 @@ def build(
         cache: Final[Path] = _pdf_cache_path(graph, pdf_cache_path)
         extraction: Final[ExtractionSummary | None] = _fetch_pdfs(
             cache,
-            indexable_pdf_embeds(rows, include_daily_notes=include_daily_notes),
+            indexable_attachment_embeds(rows, include_daily_notes=include_daily_notes),
             api_endpoint,
             _fetch_budget(max_pdfs, max_pdf_mb),
             ocr,
@@ -262,7 +263,7 @@ def build(
                 f"PDFs: fetched {extraction.extracted_count} ({_outcomes(extraction)};"
                 f" {extraction.ocr_page_count} pages by OCR), {extraction.pending_count} pending"
             )
-        records.extend(pdf_chunk_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
+        records.extend(attachment_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
     pdf_count: Final[int] = sum(1 for record in records if record.kind is RecordKind.PDF)
     typer.echo(f"fetched {len(rows)} entities; {len(records)} indexable records ({pdf_count} PDF chunks)")
 
@@ -386,7 +387,7 @@ def extract_pdfs(
     ocr: OcrOption = True,
     require_open_window: RequireOpenWindowOption = False,
 ) -> None:
-    """Fetch the graph's attached PDFs and cache their text, for indexing.
+    """Fetch the graph's attached PDFs and SVGs and cache their text, for indexing.
 
     Every PDF a block embeds is fetched decrypted through the Roam Local API, held in memory
     only, and its text layer cached page by page in an owner-only file; already-cached PDFs
@@ -399,7 +400,8 @@ def extract_pdfs(
     api_endpoint: Final[ApiEndpoint] = _api_endpoint(graph, port, token)
     resolved_cache: Final[Path] = _pdf_cache_path(graph, pdf_cache_path)
     started: Final[float] = time.perf_counter()
-    embeds: Final[list[PdfEmbed]] = pdf_embeds(fetch_graph(api_endpoint))
+    rows: Final[list[dict[str, object]]] = fetch_graph(api_endpoint)
+    embeds: Final[list[PdfEmbed]] = [*pdf_embeds(rows), *svg_embeds(rows)]
     try:
         summary: Final[ExtractionSummary] = extract_pdf_texts(
             resolved_cache,
@@ -414,7 +416,7 @@ def extract_pdfs(
         raise typer.Exit(code=1) from error
     elapsed: Final[float] = time.perf_counter() - started
     typer.echo(
-        f"{resolved_cache}: {summary.distinct_count} distinct PDFs in {len(embeds)} embeds;"
+        f"{resolved_cache}: {summary.distinct_count} distinct attachments in {len(embeds)} embeds;"
         f" extracted {summary.extracted_count} ({summary.fetched_bytes / 1_000_000:.0f} MB) in {elapsed:.1f}s"
         f" ({_outcomes(summary)}; {summary.ocr_page_count} pages by OCR); {summary.current_count} already current,"
         f" {summary.pending_count} pending"
@@ -437,6 +439,7 @@ def search(
     hits: Final[list[SearchHit]] = search_store(resolved_db, query, k=k, ollama_url=ollama_url)
     for rank, hit in enumerate(hits, start=1):
         kind: str = f"pdf p. {hit.pdf_page}" if hit.kind is RecordKind.PDF else str(hit.kind)
+        # An image hit's breadcrumb ends with its upload name, as a PDF hit's does.
         ranks: str = f"v:{hit.vector_rank or '-'} k:{hit.keyword_rank or '-'}"
         typer.echo(f"{rank:2}. (({hit.uid}))  [{kind}  score {hit.score:.4f}  {ranks}]")
         typer.echo(f"    {hit.breadcrumb}")

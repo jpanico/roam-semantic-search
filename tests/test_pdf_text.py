@@ -19,14 +19,17 @@ from roam_semantic_search.pdf_text import (
     CONSECUTIVE_FETCH_FAILURE_LIMIT,
     ExtractedText,
     ExtractionSummary,
+    Media,
     PdfEmbed,
     PdfFetchBudget,
     PdfStatus,
     PdfText,
     cached_pdf_texts,
     extract_pdf_texts,
+    extracted_svg_text,
     extracted_text,
     pdf_embeds,
+    svg_embeds,
     url_key,
 )
 
@@ -398,7 +401,7 @@ class TestOcr:
 
 
 class TestCacheSchemaUpgrade:
-    def test_a_v1_cache_gains_the_ocr_columns_keeping_its_entries(self, tmp_path: Path) -> None:
+    def test_a_v1_cache_upgrades_to_current_keeping_its_entries(self, tmp_path: Path) -> None:
         cache: Final[Path] = tmp_path / "test.pdf-text.db"
         connection: Final[sqlite3.Connection] = sqlite3.connect(cache)
         with connection:
@@ -415,7 +418,101 @@ class TestCacheSchemaUpgrade:
             )
         connection.close()
         entry: Final[PdfText] = cached_pdf_texts(cache)[url_key(url("scan.pdf"))]
-        assert (entry.status, entry.ocr_version, entry.ocr_page_count) == (PdfStatus.NO_TEXT, 0, 0)
+        assert (entry.status, entry.ocr_version, entry.ocr_page_count, entry.media) == (
+            PdfStatus.NO_TEXT,
+            0,
+            0,
+            Media.PDF,
+        )
         check: Final[sqlite3.Connection] = sqlite3.connect(cache)
-        assert check.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "2"
+        assert check.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0] == "3"
         check.close()
+
+
+_DIAGRAM_SVG: Final[bytes] = b"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">
+  <title>Request pipeline</title>
+  <desc>How a query flows from the client to the index</desc>
+  <style>.label { font: 12px sans-serif; }</style>
+  <script>console.log("never indexed")</script>
+  <metadata>generator notes, never indexed</metadata>
+  <rect x="10" y="10" width="100" height="40"/>
+  <text x="20" y="35">Client <tspan font-weight="bold">sends</tspan> a query</text>
+  <g><text x="200" y="35">Embedding server</text></g>
+  <foreignObject x="10" y="100" width="200" height="40">
+    <div xmlns="http://www.w3.org/1999/xhtml">Hybrid ranking with RRF</div>
+  </foreignObject>
+</svg>
+"""
+
+
+class TestSvgEmbeds:
+    def test_image_embeds_and_bare_urls_of_svg_uploads(self) -> None:
+        enc: Final[str] = url("Ab3dE.svg.enc")
+        plain: Final[str] = url("Xy9Zq.SVG")
+        rows: Final[list[dict[str, object]]] = [
+            {"uid": "aaaaaaaaa", "string": f"![]({enc})"},
+            {"uid": "bbbbbbbbb", "string": f"diagram at {plain} and a photo ![]({url('photo.png')})"},
+            {"uid": "ccccccccc", "string": "no attachments, though it mentions .svg files"},
+        ]
+        assert svg_embeds(rows) == [
+            PdfEmbed(host_uid="aaaaaaaaa", url=enc, media=Media.SVG),
+            PdfEmbed(host_uid="bbbbbbbbb", url=plain, media=Media.SVG),
+        ]
+
+    def test_pdfs_are_not_svgs(self) -> None:
+        assert svg_embeds([{"uid": "aaaaaaaaa", "string": f"{{{{pdf: {url('paper.pdf')}}}}}"}]) == []
+
+
+class TestExtractedSvgText:
+    def test_reads_titles_text_runs_and_foreign_objects_in_document_order(self) -> None:
+        found: Final[ExtractedText] = extracted_svg_text(_DIAGRAM_SVG)
+        assert found.status is PdfStatus.OK
+        assert found.page_texts == (
+            "Request pipeline How a query flows from the client to the index Client sends a query"
+            " Embedding server Hybrid ranking with RRF",
+        )
+        assert found.error is None
+
+    def test_shapes_without_words_have_no_text(self) -> None:
+        shapes: Final[bytes] = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="5" height="5"/></svg>'
+        assert extracted_svg_text(shapes) == ExtractedText(PdfStatus.NO_TEXT, ("",), None)
+
+    def test_malformed_xml_fails_to_parse(self) -> None:
+        found: Final[ExtractedText] = extracted_svg_text(b"<svg><text>unclosed</svg>")
+        assert (found.status, found.page_texts) == (PdfStatus.PARSE_FAILED, ())
+        assert found.error is not None
+
+    def test_external_entities_are_not_resolved(self) -> None:
+        hostile: Final[bytes] = (
+            b'<?xml version="1.0"?><!DOCTYPE svg [<!ENTITY secret SYSTEM "file:///etc/passwd">]>'
+            b'<svg xmlns="http://www.w3.org/2000/svg"><text>before &secret; after the entity text</text></svg>'
+        )
+        found: Final[ExtractedText] = extracted_svg_text(hostile)
+        assert "root:" not in " ".join(found.page_texts)
+
+
+class TestSvgExtraction:
+    def test_an_svg_is_cached_as_a_one_page_svg_entry(self, tmp_path: Path) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        svg: Final[str] = url("diagram.svg.enc")
+        source: Final[FakeSource] = FakeSource(files={svg: _DIAGRAM_SVG})
+        summary: Final[ExtractionSummary] = extract_pdf_texts(
+            cache, [PdfEmbed(host_uid="aaaaaaaaa", url=svg, media=Media.SVG)], source
+        )
+        assert summary.outcomes == {PdfStatus.OK: 1}
+        entry: Final[PdfText] = cached_pdf_texts(cache)[url_key(svg)]
+        assert (entry.media, len(entry.page_texts), entry.ocr_version) == (Media.SVG, 1, 0)
+        assert "Hybrid ranking with RRF" in entry.page_texts[0]
+
+    def test_an_ocr_run_never_refetches_an_svg(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        cache: Final[Path] = tmp_path / "test.pdf-text.db"
+        svg: Final[str] = url("shapes.svg")
+        files: Final[dict[str, bytes]] = {svg: b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'}
+        embed: Final[list[PdfEmbed]] = [PdfEmbed(host_uid="aaaaaaaaa", url=svg, media=Media.SVG)]
+        extract_pdf_texts(cache, embed, FakeSource(files=files))
+        assert cached_pdf_texts(cache)[url_key(svg)].status is PdfStatus.NO_TEXT
+        stub_ocr(monkeypatch)
+        again: Final[FakeSource] = FakeSource(files=files)
+        extract_pdf_texts(cache, embed, again, ocr=True)
+        assert again.fetched == []

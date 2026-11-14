@@ -10,10 +10,11 @@ from roam_semantic_search.normalize import (
     _chunked,
     _page_ref_names,
     _plain_text,
+    attachment_records,
+    indexable_attachment_embeds,
     normalized_records,
-    pdf_chunk_records,
 )
-from roam_semantic_search.pdf_text import PdfStatus, PdfText, url_key
+from roam_semantic_search.pdf_text import Media, PdfStatus, PdfText, url_key
 
 
 class TestPlainText:
@@ -295,7 +296,7 @@ class TestPdfChunkRecords:
 
     def test_one_record_per_chunk_of_each_text_page(self) -> None:
         long_page: Final[str] = _words(600)
-        records: Final[list[IndexRecord]] = pdf_chunk_records(
+        records: Final[list[IndexRecord]] = attachment_records(
             self._rows(f"manual: {{{{pdf: {_PDF_URL}}}}}"),
             {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed", "", long_page)},
         )
@@ -315,12 +316,12 @@ class TestPdfChunkRecords:
 
     def test_pdf_without_usable_text_yields_nothing(self) -> None:
         rows: Final[list[dict[str, object]]] = self._rows(f"{{{{[[pdf]]: {_PDF_URL}}}}}")
-        assert pdf_chunk_records(rows, {}) == []
-        assert pdf_chunk_records(rows, {"another-key": _pdf_text("text")}) == []
-        assert pdf_chunk_records(rows, {url_key(_PDF_URL): _pdf_text("", "", status=PdfStatus.NO_TEXT)}) == []
+        assert attachment_records(rows, {}) == []
+        assert attachment_records(rows, {"another-key": _pdf_text("text")}) == []
+        assert attachment_records(rows, {url_key(_PDF_URL): _pdf_text("", "", status=PdfStatus.NO_TEXT)}) == []
 
     def test_a_pdf_embedded_twice_in_one_block_is_chunked_once(self) -> None:
-        records: Final[list[IndexRecord]] = pdf_chunk_records(
+        records: Final[list[IndexRecord]] = attachment_records(
             self._rows(f"{{{{pdf: {_PDF_URL}}}}} again {{{{pdf: {_PDF_URL}}}}}"),
             {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed")},
         )
@@ -329,9 +330,61 @@ class TestPdfChunkRecords:
     def test_daily_note_pdfs_follow_the_daily_notes_switch(self) -> None:
         rows: Final[list[dict[str, object]]] = self._rows(f"{{{{pdf: {_PDF_URL}}}}}", page_uid="11-13-2026")
         texts: Final[dict[str, PdfText]] = {url_key(_PDF_URL): _pdf_text("Invoice for the garden shed")}
-        assert len(pdf_chunk_records(rows, texts)) == 1
-        assert pdf_chunk_records(rows, texts, include_daily_notes=False) == []
+        assert len(attachment_records(rows, texts)) == 1
+        assert attachment_records(rows, texts, include_daily_notes=False) == []
 
     def test_block_records_are_unaffected_by_pdfs(self) -> None:
         rows: Final[list[dict[str, object]]] = self._rows(f"{{{{pdf: {_PDF_URL}}}}}")
         assert [record.uid for record in normalized_records(rows)] == ["page00001"]  # the bare embed has no text
+
+
+_SVG_URL: Final[str] = (
+    "https://firebasestorage.googleapis.com/v0/b/test.appspot.com/o/imgs%2Fapp%2Ftest%2FQr7Tw.svg.enc"
+    "?alt=media&token=abc123"
+)
+
+
+class TestImageRecords:
+    def _rows(self, string: str) -> list[dict[str, object]]:
+        return [_page_row(1, "page00001", "Garden"), _block_row(2, "blk000001", string, 1, [1])]
+
+    def _svg_text(self, text: str, status: PdfStatus = PdfStatus.OK) -> PdfText:
+        return PdfText(
+            status=status,
+            extractor_version=1,
+            upload_name="layout.svg",
+            page_texts=(text,),
+            extracted_at="2026-11-14T00:00:00+00:00",
+            media=Media.SVG,
+        )
+
+    def test_an_svg_yields_image_records(self) -> None:
+        records: Final[list[IndexRecord]] = attachment_records(
+            self._rows(f"![]({_SVG_URL})"), {url_key(_SVG_URL): self._svg_text("Raised bed layout north side")}
+        )
+        assert [record.kind for record in records] == [RecordKind.IMAGE]
+        image: Final[IndexRecord] = records[0]
+        assert image.uid == "blk000001"
+        assert image.record_id == f"blk000001/img/{url_key(_SVG_URL)[:8]}/1.1"
+        assert image.breadcrumb == 'Garden › SVG "layout.svg"'
+        assert image.embed_input == 'Garden › SVG "layout.svg" › Raised bed layout north side'
+
+    def test_an_svg_without_text_yields_nothing(self) -> None:
+        rows: Final[list[dict[str, object]]] = self._rows(f"![]({_SVG_URL})")
+        assert attachment_records(rows, {url_key(_SVG_URL): self._svg_text("", PdfStatus.NO_TEXT)}) == []
+
+    def test_indexable_attachments_include_pdfs_and_svgs(self) -> None:
+        rows: Final[list[dict[str, object]]] = self._rows(f"{{{{pdf: {_PDF_URL}}}}} and ![]({_SVG_URL})")
+        assert [embed.media for embed in indexable_attachment_embeds(rows)] == [Media.PDF, Media.SVG]
+
+
+class TestBareStorageUrls:
+    def test_a_bare_firebase_url_is_stripped(self) -> None:
+        assert _plain_text(f"see {_SVG_URL} for the layout", {}) == "see for the layout"
+
+    def test_a_block_holding_only_a_bare_url_yields_no_record(self) -> None:
+        rows: Final[list[dict[str, object]]] = [
+            _page_row(1, "page00001", "Garden"),
+            _block_row(2, "blk000001", _SVG_URL, 1, [1]),
+        ]
+        assert [record.uid for record in normalized_records(rows)] == ["page00001"]

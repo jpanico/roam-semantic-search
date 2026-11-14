@@ -152,8 +152,9 @@ class StoredRecord(BaseModel):
         page_title: Title of the page the record belongs to.
         breadcrumb: The record's context path.
         text: The record's plain text.
-        pdf_name: For a PDF chunk, the name the PDF was uploaded under, when known.
-        pdf_page: For a PDF chunk, the 1-based page it comes from.
+        pdf_name: For an attachment record (PDF chunk or image text), the name the
+            attachment was uploaded under, when known.  The column predates images.
+        pdf_page: For an attachment record, the 1-based page it comes from (1 for an image).
     """
 
     model_config = ConfigDict(frozen=True)

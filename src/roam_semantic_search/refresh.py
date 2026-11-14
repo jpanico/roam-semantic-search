@@ -48,9 +48,9 @@ from roam_semantic_search.fetch import fetch_graph
 from roam_semantic_search.normalize import (
     IndexRecord,
     RecordKind,
-    indexable_pdf_embeds,
+    attachment_records,
+    indexable_attachment_embeds,
     normalized_records,
-    pdf_chunk_records,
 )
 from roam_semantic_search.pdf_text import (
     ExtractionSummary,
@@ -243,7 +243,7 @@ def refresh_store(
             try:
                 extraction = extract_pdf_texts(
                     cache,
-                    indexable_pdf_embeds(rows, include_daily_notes=include_daily_notes),
+                    indexable_attachment_embeds(rows, include_daily_notes=include_daily_notes),
                     LocalApiGraphSource(api_endpoint=api_endpoint),
                     budget=pdf_fetch_budget,
                     ocr=ocr,
@@ -251,7 +251,7 @@ def refresh_store(
             except (RuntimeError, requests.exceptions.RequestException) as error:
                 logger.warning("fetching PDFs failed; refreshing from the cached PDF text: %s", error)
                 pdf_error = f"{type(error).__name__}: {error}"
-        records.extend(pdf_chunk_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
+        records.extend(attachment_records(rows, cached_pdf_texts(cache), include_daily_notes=include_daily_notes))
     plan: Final[RefreshPlan] = refresh_plan(records, stored_hashes(db_path))
     embed_now, deferred = budgeted_embeds(plan.to_embed, max_pdf_embeds)
     logger.info(
