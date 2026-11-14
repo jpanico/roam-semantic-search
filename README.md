@@ -264,12 +264,40 @@ and answering from the snapshot. Searching a closed encrypted graph then costs n
 prompt. An explicit `refresh_index` call is never gated — asking for it is deliberate,
 and it is the way to say *yes, open the graph, I will unlock it*.
 
-Register with Claude Code — no per-graph configuration, since the server reads Roam's
-registry directly:
+Register it **once per Claude client you use** — no per-graph configuration, since the
+server reads Roam's registry directly. Registering the same server for two clients that
+share sessions runs two copies, and only one of them answers.
 
-```bash
-claude mcp add --scope user roam-semantic-search -- $(pwd)/.venv/bin/roam-semantic-search-mcp
-```
+- **The Claude desktop app** — its chats *and* its Code-tab sessions. Add the server to
+  `~/Library/Application Support/Claude/claude_desktop_config.json`, then quit and reopen
+  Claude:
+
+  ```json
+  {
+    "mcpServers": {
+      "roam-semantic-search": {
+        "command": "/path/to/roam-semantic-search/.venv/bin/roam-semantic-search-mcp",
+        "env": { "ROAM_SEMANTIC_SEARCH_REQUIRE_OPEN_WINDOW": "1" }
+      }
+    }
+  }
+  ```
+
+- **`claude` run in a terminal** — the app's config does not reach it:
+
+  ```bash
+  claude mcp add --scope user roam-semantic-search -- $(pwd)/.venv/bin/roam-semantic-search-mcp
+  ```
+
+  Don't add this when you use Claude Code only inside the desktop app: its sessions
+  already get the app's registration.
+
+**A running server keeps the code it started with.** After changing this project, restart
+whatever runs the server — quit and reopen the Claude app (⌘Q; a server that is still
+connected offers no Reconnect in `/mcp`), or restart the terminal `claude` session. The
+server notices when you forget: it records the source files it loaded (this project's and
+guffin's) and, once any has changed on disk, fails every tool call with a message saying
+to restart it, rather than answering from old code.
 
 **`semantic_search`, `refresh_index`, and `index_stats` each require a `graph`
 argument.** That is deliberate rather than an ergonomic oversight: with several graphs

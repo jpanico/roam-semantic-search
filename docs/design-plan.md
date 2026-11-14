@@ -531,6 +531,19 @@ Findings beyond the raw numbers:
 
 ## Decision log
 
+- **2026-11-14 — A server refuses to serve once its code changes.** A running MCP server
+  keeps the code it started with, and the Claude app keeps reporting it healthy (✓, no
+  Reconnect in `/mcp`). After 5c changed the store schema, the app's still-running copies
+  failed every hippo search with `no such column: uid` — the error naming a symptom, not
+  the cause. The server now records the `(mtime, size)` of every source file it loaded
+  from this package and guffin, re-checks them before each tool call, and once any has
+  changed fails the call with a message saying to restart it (quit and reopen Claude, or
+  the terminal `claude`). Refusing rather than warning is deliberate: old code reading an
+  index or cache newer code wrote can answer wrongly as well as fail. Found the same day:
+  the server was registered both in the Claude app's config and in `~/.claude.json`, so
+  each Code-tab session started an extra copy that never answered; the user-scope
+  registrations were removed and the README now says to register once per client.
+
 - **2026-08-07 — Search-time staleness bound (auto-refresh), not refresh-on-every-search.**
   `semantic_search` now refreshes the store first *only* when its last capture is older
   than `ROAM_SEMANTIC_SEARCH_MAX_STALENESS` (default 3600 s; negative disables). Refreshing

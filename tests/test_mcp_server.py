@@ -179,3 +179,46 @@ class TestInteractivePdfBudget:
         assert received["max_pdf_embeds"] == INTERACTIVE_MAX_PDF_EMBEDS
         assert not received.get("ocr", False)  # OCR is a second a page: never in a call someone waits on
         assert outcome.summary == leftover
+
+
+def _recorded(path: Path) -> dict[str, tuple[int, int]]:
+    status = path.stat()
+    return {str(path): (status.st_mtime_ns, status.st_size)}
+
+
+class TestStaleCodeGuard:
+    """A server whose code changed on disk after it started refuses to serve, and says to restart it."""
+
+    def test_unchanged_sources_pass(self, tmp_path: Path) -> None:
+        source: Final[Path] = tmp_path / "module.py"
+        source.write_text("x = 1\n")
+        assert mcp_server.changed_sources(_recorded(source)) == []
+
+    def test_an_edited_or_removed_source_is_reported(self, tmp_path: Path) -> None:
+        source: Final[Path] = tmp_path / "module.py"
+        source.write_text("x = 1\n")
+        baseline: Final[dict[str, tuple[int, int]]] = _recorded(source)
+        source.write_text("x = 2  # edited\n")
+        assert mcp_server.changed_sources(baseline) == [str(source)]
+        source.unlink()
+        assert mcp_server.changed_sources(baseline) == [str(source)]
+
+    def test_a_stale_server_refuses_every_tool(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        source: Final[Path] = tmp_path / "query.py"
+        source.write_text("x = 1\n")
+        monkeypatch.setattr(mcp_server, "_STARTUP_SOURCES", _recorded(source))
+        source.write_text("x = 2  # edited after the server started\n")
+        with pytest.raises(RuntimeError, match=r"query\.py.*Restart the server"):
+            mcp_server.list_indexes()
+        with pytest.raises(RuntimeError, match="Restart the server"):
+            mcp_server.semantic_search("brain", "anything")
+        with pytest.raises(RuntimeError, match="Restart the server"):
+            mcp_server.refresh_index("brain")
+        with pytest.raises(RuntimeError, match="Restart the server"):
+            mcp_server.index_stats("brain")
+
+    def test_the_baseline_covers_this_package_and_guffin(self) -> None:
+        watched: Final[set[str]] = set(mcp_server._STARTUP_SOURCES)
+        assert mcp_server.__file__ in watched
+        assert any("/guffin/" in path for path in watched)
+        assert mcp_server.changed_sources(mcp_server._STARTUP_SOURCES) == []

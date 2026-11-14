@@ -31,6 +31,13 @@ PDF budget (:data:`~roam_semantic_search.refresh.INTERACTIVE_PDF_FETCH_BUDGET` a
 bounded slice of any PDF backlog and reports the remainder, so no call waits on minutes of
 PDF work.  The CLI's ``refresh`` and ``extract-pdfs`` work a backlog through.
 
+A running server keeps the code it started with, and the app that launched it keeps
+reporting it healthy, so a server outliving a change to this project — or to guffin —
+would go on answering from old code, at best failing opaquely against an index or cache
+the new code wrote.  The server therefore records the source files it loaded at startup
+and checks them before every tool call: once any has changed on disk, every call fails
+with a message saying to restart the server (:func:`ensure_current_code`).
+
 A search answers from the index — a snapshot — never from the live graph.  To bound how
 stale an answer can be, ``semantic_search`` first auto-refreshes the index when its last
 capture is older than the staleness threshold; a failed refresh (most commonly Roam
@@ -44,6 +51,8 @@ tool schemas), so they carry no ``@validate_call`` — the framework validates a
 import enum
 import logging
 import os
+import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
@@ -153,6 +162,72 @@ class IndexSummary(BaseModel):
     graph_type: str
     indexed: bool
     db_path: str
+
+
+_WATCHED_PACKAGES: Final[frozenset[str]] = frozenset({"roam_semantic_search", "guffin"})
+"""Top-level packages whose loaded source files the stale-code check watches."""
+
+
+def loaded_source_stats(packages: frozenset[str] = _WATCHED_PACKAGES) -> dict[str, tuple[int, int]]:
+    """The modification time and size of every loaded source file of *packages*, by path.
+
+    Args:
+        packages: Top-level package names whose loaded modules are fingerprinted.
+
+    Returns:
+        ``(mtime_ns, size)`` per ``.py`` file of a module of *packages* currently in
+        :data:`sys.modules`.
+    """
+    stats: Final[dict[str, tuple[int, int]]] = {}
+    for name, module in list(sys.modules.items()):
+        path: object = getattr(module, "__file__", None)
+        if name.partition(".")[0] not in packages or not isinstance(path, str) or not path.endswith(".py"):
+            continue
+        try:
+            status: os.stat_result = os.stat(path)
+        except OSError:
+            continue
+        stats[path] = (status.st_mtime_ns, status.st_size)
+    return stats
+
+
+def changed_sources(baseline: Mapping[str, tuple[int, int]]) -> list[str]:
+    """The files of *baseline* whose modification time or size has changed, or that vanished.
+
+    Args:
+        baseline: ``(mtime_ns, size)`` by path, as :func:`loaded_source_stats` recorded it.
+
+    Returns:
+        The changed paths, sorted.
+    """
+    changed: Final[list[str]] = []
+    for path, recorded in baseline.items():
+        try:
+            status: os.stat_result = os.stat(path)
+        except OSError:
+            changed.append(path)
+            continue
+        if (status.st_mtime_ns, status.st_size) != recorded:
+            changed.append(path)
+    return sorted(changed)
+
+
+def ensure_current_code() -> None:
+    """Refuse to serve once the code this server loaded has changed on disk.
+
+    Raises:
+        RuntimeError: If any source file loaded at startup changed since — naming one,
+            and saying how to restart the server.
+    """
+    changed: Final[list[str]] = changed_sources(_STARTUP_SOURCES)
+    if not changed:
+        return
+    logger.warning("source changed since startup; refusing to serve: %s", changed)
+    raise RuntimeError(
+        f"roam-semantic-search's code changed after this MCP server started ({len(changed)} file(s), e.g."
+        f" {Path(changed[0]).name}), so it is still running the old code and may misread the index."
+        " Restart the server: quit and reopen the Claude app (⌘Q), or restart the terminal `claude` session."
+    )
 
 
 def _ollama_url() -> str:
@@ -270,6 +345,10 @@ def _store_for(graph: str) -> Path:
     return db_path
 
 
+_STARTUP_SOURCES: Final[dict[str, tuple[int, int]]] = loaded_source_stats()
+"""The source files this server loaded, as they were at startup (every import above is done)."""
+
+
 @server.tool()
 def list_indexes() -> tuple[IndexSummary, ...]:
     """The graphs connected on this machine, and which of them can be searched.
@@ -281,6 +360,7 @@ def list_indexes() -> tuple[IndexSummary, ...]:
     Returns:
         One summary per connected graph, in registry order.
     """
+    ensure_current_code()
     return tuple(
         IndexSummary(
             nickname=graph.nickname or graph.name,
@@ -322,6 +402,7 @@ def semantic_search(graph: str, query: str, k: int = 10) -> SearchResponse:
         The ranked hits, the index's identity and freshness facts, and what the
         pre-search staleness check did.
     """
+    ensure_current_code()
     db_path: Final[Path] = _store_for(graph)
     refresh: Final[AutoRefresh] = _ensured_fresh(graph, db_path)
     hits: Final[list[SearchHit]] = search_store(db_path, query, k=k, ollama_url=_ollama_url())
@@ -346,6 +427,7 @@ def refresh_index(graph: str) -> RefreshSummary:
     Returns:
         Counts of what the refresh embedded, deleted, and left untouched.
     """
+    ensure_current_code()
     return _interactive_refresh(_store_for(graph), resolve_graph(graph))
 
 
@@ -359,6 +441,7 @@ def index_stats(graph: str) -> StoreMeta:
     Returns:
         The store's meta facts.
     """
+    ensure_current_code()
     return read_meta(_store_for(graph))
 
 
